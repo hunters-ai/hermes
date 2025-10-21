@@ -15,7 +15,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/tanmay-bhat/alterdeck/config"
-	"github.com/tanmay-bhat/alterdeck/pagerduty"
 )
 
 var (
@@ -57,13 +56,6 @@ var (
 		},
 		[]string{"alert_type", "status"},
 	)
-	pagerdutyUpdates = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "alterdeck_pagerduty_updates_total",
-			Help: "The total number of PagerDuty incident updates",
-		},
-		[]string{"alert_type", "status"},
-	)
 )
 
 type AlertPayload struct {
@@ -88,7 +80,6 @@ type AlertPayload struct {
 
 type AlertProcessor struct {
 	cfg *config.Config
-	pd  *pagerduty.PagerDutyClient
 }
 
 func NewAlertProcessor(configPath string) (*AlertProcessor, error) {
@@ -97,14 +88,8 @@ func NewAlertProcessor(configPath string) (*AlertProcessor, error) {
 		return nil, fmt.Errorf("loading config: %w", err)
 	}
 
-	var pdClient *pagerduty.PagerDutyClient
-	if cfg.PagerDuty.Enabled {
-		pdClient = pagerduty.NewPagerDutyClient(cfg)
-	}
-
 	return &AlertProcessor{
 		cfg: cfg,
-		pd:  pdClient,
 	}, nil
 }
 
@@ -250,25 +235,6 @@ func (p *AlertProcessor) SendToWebhook(alertName string, payload map[string]inte
 
 	webhookRequests.Inc()
 	rundeckJobTriggers.WithLabelValues(alertName, "success").Inc()
-
-	if p.pd != nil && p.cfg.PagerDuty.Enabled {
-		go func() {
-			err := p.pd.UpdateIncidentWithRundeckJob(
-				alertName,
-				alertTime,
-				p.cfg.BaseURL,
-				alertConfig.JobID,
-				p.cfg.AuthToken,
-				payload,
-			)
-			if err != nil {
-				log.Printf("Error updating PagerDuty incidents: %v", err)
-				pagerdutyUpdates.WithLabelValues(alertName, "error").Inc()
-				return
-			}
-			pagerdutyUpdates.WithLabelValues(alertName, "success").Inc()
-		}()
-	}
 
 	return nil
 }

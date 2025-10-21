@@ -11,15 +11,6 @@ type Config struct {
 	AuthToken    string                 `yaml:"auth_token"`
 	BaseURL      string                 `yaml:"base_url"`
 	AlertConfigs map[string]AlertConfig `yaml:"alerts"`
-	PagerDuty    PagerDutyConfig        `yaml:"pagerduty"`
-}
-
-type PagerDutyConfig struct {
-	Enabled      bool   `yaml:"enabled"`
-	APIToken     string `yaml:"api_token"`
-	TimeRangeMin int    `yaml:"time_range_min"`
-	UpdateNotes  bool   `yaml:"update_notes"`
-	FromEmail    string `yaml:"from_email"`
 }
 
 type AlertConfig struct {
@@ -44,10 +35,6 @@ func LoadAlertConfig(filename string) (*Config, error) {
 			alertConfig.FieldsLocation = "commonLabels"
 			config.AlertConfigs[alertName] = alertConfig
 		}
-	}
-
-	if config.PagerDuty.TimeRangeMin == 0 {
-		config.PagerDuty.TimeRangeMin = 15
 	}
 
 	return &config, nil
