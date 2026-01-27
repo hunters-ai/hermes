@@ -198,6 +198,7 @@ class AlertProcessor:
         for field in alert_config.required_fields:
             if field in source_map:
                 target_field = alert_config.field_mappings.get(field, field)
+                logger.info(f"Mapping field '{field}' -> '{target_field}' with value '{source_map[field]}'")
                 result[target_field] = source_map[field]
             else:
                 logger.warning(f"Required field '{field}' not found in location '{fields_location}' for alert '{alert_name}'")
@@ -216,6 +217,8 @@ class AlertProcessor:
              PROCESSING_ERRORS.labels(error_type="config_not_found", alert_type=alert_name).inc()
              self._raise_error(f"no configuration found for alert: {alert_name}")
 
+        logger.info(f"Sending to Rundeck job {alert_config.job_id} with options: {json.dumps(payload, indent=2)}")
+        
         try:
             # Use RundeckClient which handles token or session-based auth
             response_data = await self.rundeck.run_job(
