@@ -31,7 +31,7 @@ class StateStoreConfig(BaseModel):
     """State store configuration."""
     type: str = Field(default="memory", description="State store type: 'memory' or 'dynamodb'")
     # DynamoDB settings
-    dynamodb_table: str = Field(default="hermes-workflows", description="DynamoDB table name")
+    dynamodb_table: str = Field(default="hunters-ops-hermes-workflows", description="DynamoDB table name")
     dynamodb_region: Optional[str] = Field(default=None, description="AWS region for DynamoDB")
     dynamodb_endpoint: Optional[str] = Field(default=None, description="Custom DynamoDB endpoint (for LocalStack)")
     ttl_hours: int = Field(default=24, description="TTL for completed workflows")

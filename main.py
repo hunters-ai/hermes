@@ -352,9 +352,12 @@ async def receive_alert(request: Request):
             # Get alert labels for matching later
             alert_labels = body.get("commonLabels", {}).copy()
             
-            # Extract Alertmanager URL from client_url for global service mode
-            # client_url format: "http://alertmanager.eu-west-1.hunters.ai/#/alerts?receiver=..."
-            alertmanager_url = extract_alertmanager_url(body.get("client_url"))
+            # Extract Alertmanager URL from externalURL for global service mode
+            # externalURL format: "http://alertmanager.eu-west-1.hunters.ai"
+            # Fallback to client_url if externalURL is not present (for compatibility)
+            alertmanager_url = extract_alertmanager_url(
+                body.get("externalURL") or body.get("client_url")
+            )
             
             workflow_id = await remediation_manager.start_remediation(
                 alert_name=alert_name,
