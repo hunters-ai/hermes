@@ -16,12 +16,23 @@ from state_store import InMemoryStateStore
 from remediation_manager import RemediationManager
 from rundeck_client import RundeckClient
 
+
+# Filter to exclude health check logs
+class HealthCheckFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return 'GET /health' not in message and 'HEAD /health' not in message
+
+
 # Initialize logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Apply health check filter to uvicorn access logger
+logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
 
 # Prometheus Metrics
 INCOMING_REQUESTS = Counter(
@@ -120,7 +131,17 @@ def extract_alertmanager_url(client_url: Optional[str]) -> Optional[str]:
         parsed = urlparse(client_url)
         # Reconstruct with just scheme, netloc (host:port)
         base_url = urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
-        return base_url if base_url else None
+        
+        if not base_url:
+            return None
+            
+        # Convert HTTP to HTTPS for external hunters.ai URLs
+        # Alertmanager externalURL comes as HTTP but external access requires HTTPS
+        if "hunters.ai" in parsed.netloc and parsed.scheme == "http":
+            parsed = parsed._replace(scheme="https")
+            base_url = urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
+        
+        return base_url
     except Exception as e:
         logger.warning(f"Failed to parse client_url '{client_url}': {e}")
         return None
