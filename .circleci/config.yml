@@ -42,7 +42,7 @@ jobs:
       - aws-ecr/build_and_push_image:
           account_id: ${AWS_ACCOUNT_ID}
           push_image: << parameters.push >>
-          repo: alterdeck
+          repo: hermes
           tag: << parameters.tag >>
           platform: << parameters.platform >>
           region: ${AWS_REGION}
