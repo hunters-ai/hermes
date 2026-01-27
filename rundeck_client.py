@@ -67,11 +67,12 @@ class RundeckClient:
                     follow_redirects=True
                 )
                 
-                # Extract JSESSIONID cookie
-                self._session_cookie = client.cookies.get("JSESSIONID")
+                # Extract JSESSIONID cookie from response cookies
+                # Check both response cookies and client cookies
+                self._session_cookie = response.cookies.get("JSESSIONID") or client.cookies.get("JSESSIONID")
                 
                 if self._session_cookie:
-                    logger.info("Successfully authenticated with Rundeck")
+                    logger.info(f"Successfully authenticated with Rundeck (session: {self._session_cookie[:8]}...)")
                     return True
                 else:
                     logger.error("Failed to obtain session cookie from Rundeck")

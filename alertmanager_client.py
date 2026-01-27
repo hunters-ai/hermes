@@ -45,7 +45,6 @@ class AlertmanagerClient:
                 response = await client.get(url, headers=self._get_headers(), params=query_params)
                 response.raise_for_status()
                 alerts = response.json()
-                logger.debug(f"Retrieved {len(alerts)} alerts with {len(query_params)} filters")
                 return alerts
             except httpx.HTTPError as e:
                 logger.error(f"Error fetching alerts from Alertmanager: {e}")

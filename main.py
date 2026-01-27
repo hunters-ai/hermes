@@ -172,9 +172,6 @@ class AlertProcessor:
         if not alert_name:
             PROCESSING_ERRORS.labels(error_type="missing_alertname", alert_type="unknown").inc()
             logger.error("Alert name not found in payload")
-            logger.debug(f"Payload keys: {list(payload.keys())}")
-            if "commonLabels" in payload:
-                logger.debug(f"commonLabels: {payload['commonLabels']}")
             self._raise_error("alertname not found in payload")
 
         ALERTS_RECEIVED_BY_TYPE.labels(alert_type=alert_name).inc()
@@ -196,7 +193,6 @@ class AlertProcessor:
             source_map = payload.get(fields_location, {})
             if not isinstance(source_map, dict):
                  logger.warning(f"Fields location '{fields_location}' not found or not a dict for alert '{alert_name}'")
-                 logger.debug(f"Available payload keys: {list(payload.keys())}")
                  source_map = {}
 
         for field in alert_config.required_fields:

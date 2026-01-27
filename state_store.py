@@ -100,7 +100,6 @@ class InMemoryStateStore(StateStore):
     async def save(self, workflow: RemediationWorkflow) -> None:
         async with self._lock:
             self._workflows[workflow.id] = workflow
-            logger.debug(f"Saved workflow {workflow.id} with state {workflow.state}")
     
     async def get(self, workflow_id: str) -> Optional[RemediationWorkflow]:
         return self._workflows.get(workflow_id)
@@ -255,8 +254,6 @@ class DynamoDBStateStore(StateStore):
         # Run in executor to avoid blocking
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: self.table.put_item(Item=item))
-        
-        logger.debug(f"Saved workflow {workflow.id} to DynamoDB")
     
     async def get(self, workflow_id: str) -> Optional[RemediationWorkflow]:
         """Get a workflow by ID."""
@@ -364,6 +361,4 @@ class DynamoDBStateStore(StateStore):
             None,
             lambda: self.table.delete_item(Key={"id": workflow_id})
         )
-        
-        logger.debug(f"Deleted workflow {workflow_id} from DynamoDB")
 

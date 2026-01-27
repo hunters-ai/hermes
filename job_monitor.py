@@ -28,7 +28,6 @@ class JobMonitor:
         """
         data = await self.client.get_execution(execution_id)
         status = data.get("status", "unknown")
-        logger.debug(f"Execution {execution_id} status: {status}")
         return status, data
     
     async def get_execution_options(self, execution_id: str) -> Dict[str, str]:
@@ -49,7 +48,6 @@ class JobMonitor:
             # Parse -option value format
             options = self._parse_argstring(argstring)
         
-        logger.debug(f"Execution {execution_id} options: {options}")
         return options
     
     def _parse_argstring(self, argstring: str) -> Dict[str, str]:
