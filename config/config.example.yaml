@@ -1,0 +1,59 @@
+# Rundeck configuration
+auth_token: "${RUNDECK_AUTH_TOKEN}"
+base_url: "https://rundeck.example.com"
+
+# Remediation settings
+remediation:
+  poll_interval_seconds: 30 # How often to check job status
+  resolution_wait_minutes: 5 # Wait after job success before checking alert
+  max_job_wait_minutes: 30 # Max time to wait for job completion
+
+# State store config (choose 'memory' or 'dynamodb')
+state_store:
+  type: "dynamodb" # Use "memory" for dev/testing
+  dynamodb_table: "hermes-workflows"
+  dynamodb_region: "us-east-1" # Optional
+  ttl_hours: 24
+
+# Alertmanager integration (required for remediation monitoring)
+alertmanager:
+  base_url: "https://alertmanager.example.com"
+  bearer_token: "" # Optional auth token
+
+# JIRA integration
+jira:
+  base_url: "https://company.atlassian.net"
+  api_token: "${JIRA_API_TOKEN}"
+  user_email: "automation@company.com"
+
+# Slack integration
+slack:
+  webhook_url: "${SLACK_WEBHOOK_URL}"
+  # Or use bot token for more control:
+  # bot_token: "${SLACK_BOT_TOKEN}"
+  noc_channel: "#noc-alerts"
+  noc_user_group: "noc-on-call" # For @mentions
+
+# Alert-specific configurations
+alerts:
+  KubeNodeOutOfSpace:
+    job_id: "disk-cleanup-job-id"
+    required_fields:
+      - "instance"
+      - "device"
+      - "mountpoint"
+    fields_location: "commonLabels"
+    remediation:
+      enabled: true
+      resolution_wait_minutes: 10 # Override global default
+      jira_ticket_option: "jira_ticket" # Rundeck option name for ticket ID
+
+  HighMemoryUsage:
+    job_id: "memory-cleanup-job-id"
+    required_fields:
+      - "instance"
+      - "namespace"
+    fields_location: "commonLabels"
+    remediation:
+      enabled: true
+      resolution_wait_minutes: 5

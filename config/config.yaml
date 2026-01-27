@@ -1,0 +1,44 @@
+# Rundeck configuration - uses new nested format
+rundeck:
+  base_url: "http://rundeck.internal.hntrsops.com"
+  api_version: 52
+  timeout: 120
+  verify_ssl: true
+  # Session-based auth (no expiration!)
+  username: "${RUNDECK_USERNAME}"
+  password: "${RUNDECK_PASSWORD}"
+
+remediation:
+  poll_interval_seconds: 30
+  resolution_wait_minutes: 5
+  max_job_wait_minutes: 30
+
+state_store:
+  type: "dynamodb"
+  dynamodb_table: "hunters-ops-hermes-workflows"
+  dynamodb_region: "us-west-2"
+  ttl_hours: 24
+jira:
+  base_url: "https://api.atlassian.com/ex/jira/0e1a6846-648a-4adf-b321-514ce8001d56"
+  api_token: "${JIRA_API_TOKEN}"
+  user_email: "jiraalertbot-923reuug8w@serviceaccount.atlassian.com"
+
+alerts:
+  'Node is in NotReady state for 30 minutes':
+    fields_location: commonLabels
+    job_id: 4d47bff5-c549-48da-9aad-d5ac0619fc94
+    remediation:
+      enabled: true
+      jira_ticket_option: jira_ticket
+      resolution_wait_minutes: 5
+    required_fields:
+      - node
+      - cluster
+    field_mappings:
+      node: node_name
+
+slack:
+  enabled: true
+  noc_channel: "#alerts-sandbox" # Changed from nocChannel
+  noc_user_group: "noc-on-call"
+  webhook_url: "${SLACK_WEBHOOK_URL}"

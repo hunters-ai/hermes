@@ -1,86 +1,141 @@
-# AlterDeck
+# Hermes
 
-AlterDeck is a tiny HTTP service that processes Prometheus alerts and forwards them to Rundeck jobs for automated remediation / job triggering. It acts as an middleware that extracts required parameters i.e options from alert payloads and triggers corresponding Rundeck automation jobs.
+**Hermes** - Swift messenger for automated alert remediation. Named after the Greek god known for speed and as the messenger of the gods.
 
-## What it does :
-- Receives Alertmanager webhook alerts via HTTP API
-- Extracts required fields from alert payloads based on supplied config file mapping
-- Automatically triggers Rundeck jobs with extracted alert data
-- Exposes prometheus metrics for monitoring and stats
+Hermes is an automated alert remediation orchestrator that processes Prometheus alerts and triggers Rundeck jobs for automated remediation. It monitors job completion, verifies alert resolution, and escalates to NOC when remediation fails.
 
-## To test the service : 
+## Features
 
-1. Configure a route in alertmanager to send alerts to the webhook
-```yaml
-receivers:
-- name: alterdeck
-    webhook_configs:
-    - url: 'http://your-alertdeck-address:8080/api/v1/alerts'
-        send_resolved: false
+- **Global Service Mode**: Receives alerts from multiple Alertmanagers, automatically extracting the source URL from `client_url`
+- **Alert Processing**: Receives Alertmanager webhook alerts and triggers Rundeck jobs
+- **Session-Based Auth**: Supports Rundeck username/password authentication (no 30-day token expiry!)
+- **Job Monitoring**: Polls Rundeck for job completion status
+- **Alert Verification**: Checks Alertmanager to confirm alerts are resolved after remediation
+- **JIRA Integration**: Adds comments to JIRA tickets with remediation results
+- **Slack Escalation**: Notifies NOC on-call when remediation fails
+- **Prometheus Metrics**: Exposes metrics for monitoring
 
-routes:
-- match_re:
-    service: your-service
-    severity: error
-receiver: alterdeck
+## Architecture
+
+```
+┌─────────────────┐     ┌───────────────┐     ┌──────────┐
+│ Alertmanager(s) │────▶│    Hermes     │────▶│ Rundeck  │
+│ (eu-west-1)     │     │  (global)     │     │          │
+│ (us-west-2)     │     └───────────────┘     └──────────┘
+│ (ap-south-1)    │            │                   │
+└─────────────────┘            │ (poll status)     │
+       ▲                       ◀───────────────────┘
+       │                       │
+       │ (verify resolved)     ├───▶ JIRA (comment)
+       └───────────────────────┤
+                               └───▶ Slack (escalate)
 ```
 
-Create a `config/config.yaml` file with the following structure:
+## Remediation Workflow
+
+1. **Alert Received** → Extract source Alertmanager URL from `client_url`, trigger Rundeck job
+2. **Poll Job Status** → Wait for completion (configurable timeout)
+3. **Job Succeeded** → Wait X minutes, check if alert resolved (queries source Alertmanager)
+4. **Alert Resolved** → Add success comment to JIRA
+5. **Alert Still Firing** → Add failure comment to JIRA, escalate to Slack
+
+## Quick Start
+
+1. **Configure** `config/config.yaml`:
 
 ```yaml
-# Rundeck configuration
-auth_token: "your-rundeck-auth-token"
-base_url: "https://your-rundeck-server.com"
+# Session-based auth (recommended - no expiration!)
+rundeck:
+  base_url: "https://rundeck.example.com"
+  username: "${RUNDECK_USERNAME}"
+  password: "${RUNDECK_PASSWORD}"
+
+remediation:
+  poll_interval_seconds: 30
+  resolution_wait_minutes: 5
+  max_job_wait_minutes: 30
+
+# Optional: JIRA integration
+jira:
+  base_url: "https://company.atlassian.net"
+  api_token: "${JIRA_API_TOKEN}"
+  user_email: "automation@company.com"
+
+# Optional: Slack escalation
+slack:
+  webhook_url: "${SLACK_WEBHOOK_URL}"
+  noc_channel: "#noc-alerts"
+  noc_user_group: "noc-on-call"
 
 # Alert configurations
 alerts:
-  KubeNodeOutofSpace: #alertname field from alert payload
+  "Investigation pipeline delay is more than 20 minutes":
+    job_id: "rundeck-job-uuid"
+    fields_location: "details"
     required_fields:
-      - "instance"
-      - "device"
-      - "mountpoint"
-    job_id: "disk-cleanup-job-id"
-    fields_location: "commonLabels"  # or "root" for top-level fields
+      - "org_code"
+      - "service"
+    remediation:
+      enabled: true
+      jira_ticket_option: "jira_ticket"
 ```
 
-**Example Alert Payload from alertmanager, I shared it here to understand the JSON structure:**
-```json
-{
-  "receiver": "webhook",
-  "status": "firing",
-  "alerts": [
-    {
-      "status": "firing",
-      "labels": {
-        "alertname": "KubeNodeOutofSpace",
-        "severity": "warning"
-      },
-      "startsAt": "2023-10-21T10:00:00Z",
-      "generatorURL": "http://prometheus:9090/graph?g0.expr=...",
-      "fingerprint": "abc123"
-    }
-  ],
-  "commonLabels": {
-    "alertname": "KubeNodeOutofSpace",
-    "instance": "server01:9100",
-    "device": "/dev/sda1",
-    "mountpoint": "/",
-    "severity": "warning"
-  },
-  "externalURL": "http://alertmanager:9093",
-  "version": "4",
-  "groupKey": "{}:{alertname=\"KubeNodeOutofSpace\"}"
-}
+2. **Run locally**:
+```bash
+pip install -r requirements.txt
+python main.py
 ```
 
-### Metrics
+3. **Deploy to Kubernetes**:
+```bash
+helm install hermes helm-charts/alterdeck --values values.yaml
+```
 
-AlterDeck exposes the following Prometheus metrics:
+## API Endpoints
 
-- `alterdeck_incoming_requests_total`: Total number of incoming alert requests
-- `alterdeck_webhook_requests_total`: Total number of webhook requests sent to Rundeck
-- `alterdeck_webhook_errors_total`: Total number of webhook request errors
-- `alterdeck_processing_duration_seconds`: Time taken to process alert requests
-- `alterdeck_alerts_received_total`: Total alerts received by type
-- `alterdeck_processing_errors_total`: Total processing errors by type
-- `alterdeck_rundeck_job_triggers_total`: Total Rundeck job triggers by status
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check |
+| `/metrics` | GET | Prometheus metrics |
+| `/api/v1/alerts` | POST | Receive Alertmanager webhooks |
+| `/api/v1/remediations` | GET | List active remediation workflows |
+| `/api/v1/remediations/{id}` | GET | Get workflow status |
+
+## Alertmanager Configuration
+
+```yaml
+receivers:
+  - name: hermes
+    webhook_configs:
+      - url: 'http://hermes:8080/api/v1/alerts'
+        send_resolved: false
+
+routes:
+  - match:
+      severity: critical
+    receiver: hermes
+```
+
+## Metrics
+
+| Metric | Description |
+|--------|-------------|
+| `hermes_incoming_requests_total` | Total incoming alert requests |
+| `hermes_webhook_requests_total` | Webhook requests sent to Rundeck |
+| `hermes_webhook_errors_total` | Webhook request errors |
+| `hermes_processing_duration_seconds` | Processing time histogram |
+| `hermes_rundeck_job_triggers_total` | Job triggers by status |
+| `hermes_remediation_workflows_total` | Remediation workflows started |
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `CONFIG_PATH` | Path to config file (default: `config/config.yaml`) |
+| `RUNDECK_USERNAME` | Rundeck username (for session auth) |
+| `RUNDECK_PASSWORD` | Rundeck password (for session auth) |
+| `RUNDECK_AUTH_TOKEN` | Rundeck API token (legacy, expires in 30 days) |
+| `JIRA_API_TOKEN` | JIRA API token |
+| `SLACK_WEBHOOK_URL` | Slack webhook URL |
+| `PORT` | Server port (default: 8080) |
+| `DEBUG` | Enable debug logging |

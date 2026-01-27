@@ -1,0 +1,72 @@
+# Hermes Configuration
+# 
+# This service runs as a GLOBAL service that receives alerts from multiple
+# Alertmanager instances. The source Alertmanager URL is automatically 
+# extracted from each alert's `client_url` field to query the correct
+# Alertmanager when checking if alerts have resolved.
+
+# Rundeck Configuration - Session-Based Authentication (Recommended)
+# This uses username/password to get a session cookie - no expiration!
+rundeck:
+  base_url: "https://rundeck.example.com"
+  # Session-based auth (preferred, no 30-day expiration!)
+  username: "${RUNDECK_USERNAME}"
+  password: "${RUNDECK_PASSWORD}"
+  # Connection options
+  api_version: 52
+  timeout: 30
+  verify_ssl: true
+
+# Alert Configurations
+# Map alert names to Rundeck jobs
+alerts:
+  # Example: Investigation pipeline delay alert
+  "Investigation pipeline delay is more than 20 minutes":
+    job_id: "abc12345-defg-6789-hijk-lmnop1234567"
+    fields_location: "details"  # Where to extract fields from the payload
+    required_fields:
+      - "org_code"
+      - "service"
+    remediation:
+      enabled: true
+      resolution_wait_minutes: 5
+      jira_ticket_option: "jira_ticket"
+
+  # Another example
+  "High CPU Usage":
+    job_id: "job-id-for-cpu-remediation"
+    fields_location: "commonLabels"
+    required_fields:
+      - "instance"
+      - "cluster"
+
+# Remediation monitoring settings
+remediation:
+  poll_interval_seconds: 30    # How often to check Rundeck job status
+  resolution_wait_minutes: 5   # Wait time after job success before checking alert
+  max_job_wait_minutes: 30     # Timeout for job completion
+
+# State store for workflow tracking
+state_store:
+  type: memory  # Options: "memory" or "dynamodb"
+  # DynamoDB settings (when type: dynamodb)
+  # dynamodb_table: "hermes-workflows"
+  # dynamodb_region: "us-east-1"
+  # ttl_hours: 24
+
+# Optional: Default Alertmanager (fallback if client_url not in alert)
+# Not required for global service mode - URL is extracted from each alert's client_url
+# alertmanager:
+#   base_url: "http://alertmanager:9093"
+
+# Optional: JIRA integration for ticket updates
+# jira:
+#   base_url: "https://company.atlassian.net"
+#   api_token: "${JIRA_API_TOKEN}"
+#   user_email: "automation@example.com"
+
+# Optional: Slack integration for escalations
+# slack:
+#   webhook_url: "${SLACK_WEBHOOK_URL}"
+#   noc_channel: "#noc-alerts"
+#   noc_user_group: "noc-on-call"
