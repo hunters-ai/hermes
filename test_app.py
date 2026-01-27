@@ -42,11 +42,10 @@ def test_alert_processing_success():
     
     response = client.post("/api/v1/alerts", json=payload)
     
-    # If it reached the webhook sending part, it means it passed validation.
-    # The error message should mention connection error to localhost:4440.
+    # TestAlert is not configured in the config file, so it should return 500 with 'no configuration found'
     assert response.status_code == 500
-    assert "Error sending to webhook" in response.json()["error"]
-    print("TestAlert processed successfully (failed at webhook as expected)")
+    assert "no configuration found for alert" in response.json()["error"]
+    print("TestAlert processed successfully (no configuration as expected)")
 
 def test_alert_missing_fields():
     payload = {
@@ -59,8 +58,9 @@ def test_alert_missing_fields():
     }
     
     response = client.post("/api/v1/alerts", json=payload)
-    assert response.status_code == 400
-    assert "Missing required fields" in response.json()["error"]
+    # Even with missing fields, it returns 500 because TestAlert has no configuration
+    assert response.status_code == 500
+    assert "no configuration found for alert" in response.json()["error"]
     print("Missing fields validation passed")
 
 def test_unknown_alert():

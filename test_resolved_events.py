@@ -126,12 +126,17 @@ class TestRemediationManagerHandleResolvedEvent:
         )
         return config
     
+    @pytest.fixture
+    def mock_rundeck_client(self):
+        """Create mock Rundeck client for testing."""
+        return MagicMock()
+    
     @pytest.mark.asyncio
-    async def test_signal_resolution_event(self, mock_config, state_store, sample_workflow):
+    async def test_signal_resolution_event(self, mock_config, mock_rundeck_client, state_store, sample_workflow):
         """Should set resolution event when matching workflow found."""
         await state_store.save(sample_workflow)
         
-        manager = RemediationManager(mock_config, state_store)
+        manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
         
         # Simulate that workflow is being monitored
         resolution_event = asyncio.Event()
@@ -147,9 +152,9 @@ class TestRemediationManagerHandleResolvedEvent:
         assert resolution_event.is_set()
     
     @pytest.mark.asyncio
-    async def test_no_matching_workflow(self, mock_config, state_store):
+    async def test_no_matching_workflow(self, mock_config, mock_rundeck_client, state_store):
         """Should return None when no matching workflow found."""
-        manager = RemediationManager(mock_config, state_store)
+        manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
         
         result = await manager.handle_resolved_event(
             "NonExistentAlert",
@@ -159,11 +164,11 @@ class TestRemediationManagerHandleResolvedEvent:
         assert result is None
     
     @pytest.mark.asyncio
-    async def test_workflow_not_being_monitored(self, mock_config, state_store, sample_workflow):
+    async def test_workflow_not_being_monitored(self, mock_config, mock_rundeck_client, state_store, sample_workflow):
         """Should return None when workflow exists but not actively monitored."""
         await state_store.save(sample_workflow)
         
-        manager = RemediationManager(mock_config, state_store)
+        manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
         # Don't add to _resolution_events - simulating workflow not monitored
         
         result = await manager.handle_resolved_event(
@@ -192,12 +197,17 @@ class TestRemediationManagerWaitForAlertResolution:
         config.get_alert_config.return_value = None
         return config
     
+    @pytest.fixture
+    def mock_rundeck_client(self):
+        """Create mock Rundeck client for testing."""
+        return MagicMock()
+    
     @pytest.mark.asyncio
-    async def test_early_resolution_via_event(self, mock_config, state_store, sample_workflow):
+    async def test_early_resolution_via_event(self, mock_config, mock_rundeck_client, state_store, sample_workflow):
         """Should return True immediately when resolution event is set."""
         await state_store.save(sample_workflow)
         
-        manager = RemediationManager(mock_config, state_store)
+        manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
         
         resolution_event = asyncio.Event()
         resolution_event.set()  # Pre-set the event
@@ -212,11 +222,11 @@ class TestRemediationManagerWaitForAlertResolution:
         assert result is True
     
     @pytest.mark.asyncio
-    async def test_resolution_via_polling(self, mock_config, state_store, sample_workflow):
+    async def test_resolution_via_polling(self, mock_config, mock_rundeck_client, state_store, sample_workflow):
         """Should return True when polling confirms alert is resolved."""
         await state_store.save(sample_workflow)
         
-        manager = RemediationManager(mock_config, state_store)
+        manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
         manager._check_alert_resolved = AsyncMock(return_value=True)
         
         resolution_event = asyncio.Event()
@@ -231,14 +241,14 @@ class TestRemediationManagerWaitForAlertResolution:
         manager._check_alert_resolved.assert_called()
     
     @pytest.mark.asyncio
-    async def test_timeout_when_alert_still_firing(self, mock_config, state_store, sample_workflow):
+    async def test_timeout_when_alert_still_firing(self, mock_config, mock_rundeck_client, state_store, sample_workflow):
         """Should return False when timeout reached and alert still firing."""
         await state_store.save(sample_workflow)
         
         # Very short timeout and interval for testing
         mock_config.remediation.alert_check_interval_seconds = 0.1
         
-        manager = RemediationManager(mock_config, state_store)
+        manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
         manager._check_alert_resolved = AsyncMock(return_value=False)
         
         resolution_event = asyncio.Event()
@@ -253,13 +263,13 @@ class TestRemediationManagerWaitForAlertResolution:
         assert result is False
     
     @pytest.mark.asyncio
-    async def test_event_set_during_wait(self, mock_config, state_store, sample_workflow):
+    async def test_event_set_during_wait(self, mock_config, mock_rundeck_client, state_store, sample_workflow):
         """Should return True when event is set during wait interval."""
         await state_store.save(sample_workflow)
         
         mock_config.remediation.alert_check_interval_seconds = 5  # Long interval
         
-        manager = RemediationManager(mock_config, state_store)
+        manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
         manager._check_alert_resolved = AsyncMock(return_value=False)
         
         resolution_event = asyncio.Event()
