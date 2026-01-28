@@ -316,16 +316,19 @@ class DynamoDBStateStore(StateStore):
         ]
         active_states = [s.value for s in RemediationState if s.value not in completed_states]
         
+        # Query the GSI for each active state since state is a key attribute
+        # Cannot use FilterExpression on GSI key attributes
+        items = []
         try:
-            response = await loop.run_in_executor(
-                None,
-                lambda: self.table.query(
-                    IndexName=self.ALERT_NAME_STATE_INDEX,
-                    KeyConditionExpression=Key("alert_name").eq(alert_name),
-                    FilterExpression=Attr("state").is_in(active_states)
+            for state in active_states:
+                response = await loop.run_in_executor(
+                    None,
+                    lambda s=state: self.table.query(
+                        IndexName=self.ALERT_NAME_STATE_INDEX,
+                        KeyConditionExpression=Key("alert_name").eq(alert_name) & Key("state").eq(s)
+                    )
                 )
-            )
-            items = response.get("Items", [])
+                items.extend(response.get("Items", []))
         except Exception as e:
             logger.warning(f"GSI query failed for alert_name '{alert_name}', falling back to scan: {e}")
             response = await loop.run_in_executor(
