@@ -1,3 +1,8 @@
+"""
+Hermes FastAPI Application.
+
+Main application entry point with all API routes and middleware.
+"""
 import logging
 import os
 import time
@@ -5,16 +10,18 @@ import json
 from urllib.parse import urlparse, urlunparse
 from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, HTTPException, status, Response
 from fastapi.responses import JSONResponse
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
-import httpx
 from pydantic import BaseModel, Field
 
-from config import load_alert_config, Config
-from state_store import InMemoryStateStore
-from remediation_manager import RemediationManager
-from rundeck_client import RundeckClient
+from hermes.config import load_alert_config, Config
+from hermes.core.state_store import InMemoryStateStore, DynamoDBStateStore
+from hermes.core.remediation_manager import RemediationManager
+from hermes.clients.rundeck import RundeckClient
+from hermes.utils.audit_logger import get_audit_logger
+from hermes.utils.rate_limiter import RateLimiter
 
 
 # Filter to exclude health check logs
@@ -71,6 +78,26 @@ REMEDIATION_WORKFLOWS = Counter(
     "The total number of remediation workflows started",
     ["alert_type"]
 )
+ALERTS_DEDUPLICATED = Counter(
+    "hermes_alerts_deduplicated_total",
+    "The total number of alerts skipped due to deduplication",
+    ["alert_type", "reason"]
+)
+CIRCUIT_BREAKER_TRIPS = Counter(
+    "hermes_circuit_breaker_trips_total",
+    "The total number of circuit breaker trips",
+    ["service"]
+)
+REMEDIATION_OUTCOMES = Counter(
+    "hermes_remediation_outcomes_total",
+    "The total number of remediation outcomes by result",
+    ["alert_type", "outcome"]
+)
+RATE_LIMITED_REQUESTS = Counter(
+    "hermes_rate_limited_requests_total",
+    "The total number of rate limited requests",
+    ["source", "limit_type"]
+)
 
 # Load Config
 CONFIG_PATH = os.getenv("CONFIG_PATH", "config/config.yaml")
@@ -83,11 +110,10 @@ except Exception as e:
     logger.error(f"Failed to load configuration: {e}")
     app_config = None
 
-# Initialize State Store based on config
-def create_state_store(config):
+
+def create_state_store(config: Config):
     """Create state store based on configuration."""
     if config.state_store.type == "dynamodb":
-        from state_store import DynamoDBStateStore
         return DynamoDBStateStore(
             table_name=config.state_store.dynamodb_table,
             region=config.state_store.dynamodb_region,
@@ -97,15 +123,49 @@ def create_state_store(config):
     else:
         return InMemoryStateStore()
 
+
 state_store = create_state_store(app_config) if app_config else InMemoryStateStore()
 rundeck_client = app_config.create_rundeck_client() if app_config else None
-remediation_manager = RemediationManager(app_config, state_store, rundeck_client) if app_config and rundeck_client else None
+
+
+def record_remediation_outcome(alert_name: str, outcome: str):
+    """Callback to record remediation outcomes in Prometheus metrics."""
+    REMEDIATION_OUTCOMES.labels(alert_type=alert_name, outcome=outcome).inc()
+
+
+remediation_manager = RemediationManager(
+    app_config, 
+    state_store, 
+    rundeck_client,
+    metrics_callback=record_remediation_outcome
+) if app_config and rundeck_client else None
+
+# Initialize rate limiter based on config
+rate_limiter: Optional[RateLimiter] = None
+if app_config and getattr(app_config.remediation, 'rate_limit_enabled', True):
+    rate_limiter = RateLimiter(
+        default_rate=getattr(app_config.remediation, 'rate_limit_per_source_rate', 10.0),
+        default_burst=getattr(app_config.remediation, 'rate_limit_per_source_burst', 50),
+        global_rate=getattr(app_config.remediation, 'rate_limit_global_rate', 100.0),
+        global_burst=getattr(app_config.remediation, 'rate_limit_global_burst', 500)
+    )
+    logger.info("Rate limiter initialized")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle."""
     logger.info("Hermes starting up...")
+    
+    # Recover active workflows from state store on startup
+    if remediation_manager:
+        try:
+            recovered_count = await remediation_manager.recover_active_workflows()
+            if recovered_count > 0:
+                logger.info(f"Recovered {recovered_count} active workflows from state store")
+        except Exception as e:
+            logger.error(f"Failed to recover workflows on startup: {e}")
+    
     yield
     # Shutdown
     logger.info("Hermes shutting down...")
@@ -136,7 +196,6 @@ def extract_alertmanager_url(client_url: Optional[str]) -> Optional[str]:
             return None
             
         # Convert HTTP to HTTPS for external hunters.ai URLs
-        # Alertmanager externalURL comes as HTTP but external access requires HTTPS
         if "hunters.ai" in parsed.netloc and parsed.scheme == "http":
             parsed = parsed._replace(scheme="https")
             base_url = urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
@@ -180,11 +239,13 @@ class AlertPayload(BaseModel):
 
 
 class AlertProcessor:
+    """Processes incoming alerts and triggers Rundeck jobs."""
+    
     def __init__(self, config: Config, rundeck: RundeckClient):
         self.config = config
         self.rundeck = rundeck
 
-    def process_alert(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def process_alert(self, payload: Dict[str, Any]) -> tuple:
         alert_name = payload.get("commonLabels", {}).get("alertname")
         
         if not alert_name and payload.get("alerts"):
@@ -213,8 +274,8 @@ class AlertProcessor:
         else:
             source_map = payload.get(fields_location, {})
             if not isinstance(source_map, dict):
-                 logger.warning(f"Fields location '{fields_location}' not found or not a dict for alert '{alert_name}'")
-                 source_map = {}
+                logger.warning(f"Fields location '{fields_location}' not found or not a dict for alert '{alert_name}'")
+                source_map = {}
 
         for field in alert_config.required_fields:
             if field in source_map:
@@ -235,13 +296,12 @@ class AlertProcessor:
         """Send to Rundeck and return execution details."""
         alert_config = self.config.get_alert_config(alert_name)
         if not alert_config:
-             PROCESSING_ERRORS.labels(error_type="config_not_found", alert_type=alert_name).inc()
-             self._raise_error(f"no configuration found for alert: {alert_name}")
+            PROCESSING_ERRORS.labels(error_type="config_not_found", alert_type=alert_name).inc()
+            self._raise_error(f"no configuration found for alert: {alert_name}")
 
         logger.info(f"Sending to Rundeck job {alert_config.job_id} with options: {json.dumps(payload, indent=2)}")
         
         try:
-            # Use RundeckClient which handles token or session-based auth
             response_data = await self.rundeck.run_job(
                 job_id=alert_config.job_id,
                 options=payload
@@ -255,7 +315,6 @@ class AlertProcessor:
         WEBHOOK_REQUESTS.inc()
         RUNDECK_JOB_TRIGGERS.labels(alert_type=alert_name, status="success").inc()
         
-        # Return execution details for remediation tracking
         return {
             "execution_id": str(response_data.get("id", "")),
             "execution_url": response_data.get("permalink") or response_data.get("href", "")
@@ -289,8 +348,64 @@ async def metrics():
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
+    """Basic health check endpoint - always returns healthy if service is running."""
     return {"status": "healthy", "remediation_enabled": app_config.is_remediation_enabled() if app_config else False}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    """
+    Readiness probe that checks external dependencies.
+    
+    Returns 503 if any critical dependency is unhealthy.
+    """
+    health_status = {
+        "status": "healthy",
+        "config_loaded": app_config is not None,
+        "dependencies": {}
+    }
+    
+    is_healthy = True
+    
+    # Check DynamoDB state store
+    if app_config and app_config.state_store.type == "dynamodb":
+        try:
+            await state_store.get("__health_check__")
+            health_status["dependencies"]["dynamodb"] = "healthy"
+        except Exception as e:
+            health_status["dependencies"]["dynamodb"] = f"unhealthy: {str(e)[:100]}"
+            is_healthy = False
+    else:
+        health_status["dependencies"]["dynamodb"] = "not_configured"
+    
+    # Check circuit breaker states
+    if remediation_manager:
+        circuit_states = {}
+        for service, cb in remediation_manager._circuit_breakers.items():
+            if cb.is_open:
+                circuit_states[service] = "open"
+                is_healthy = False
+            else:
+                circuit_states[service] = "closed"
+        health_status["circuit_breakers"] = circuit_states
+        
+        # Include active workflow count
+        health_status["active_workflows"] = len(remediation_manager._running_tasks)
+        health_status["max_workflows"] = remediation_manager.max_concurrent_workflows
+    
+    if not is_healthy:
+        health_status["status"] = "unhealthy"
+        return JSONResponse(status_code=503, content=health_status)
+    
+    return health_status
+
+
+@app.get("/health/live")
+async def health_live():
+    """
+    Liveness probe - simple check that the service is running.
+    """
+    return {"status": "alive"}
 
 
 @app.post("/api/v1/alerts")
@@ -333,7 +448,7 @@ async def receive_alert(request: Request):
     except ValueError as e:
         logger.error(f"Error processing alert: {e}")
         if "no configuration found" in str(e):
-             return JSONResponse(status_code=500, content={"error": f"Error processing alert: {e}"})
+            return JSONResponse(status_code=500, content={"error": f"Error processing alert: {e}"})
         return JSONResponse(status_code=500, content={"error": str(e)})
 
     logger.info(f"Received alert: {alert_name}")
@@ -352,14 +467,78 @@ async def receive_alert(request: Request):
             }
         )
 
+    # Check rate limiting before processing
+    alertmanager_source = body.get("externalURL") or body.get("client_url") or "unknown"
+    if rate_limiter:
+        allowed, rate_limit_reason = await rate_limiter.try_acquire(alertmanager_source)
+        if not allowed:
+            limit_type = "global" if "Global" in (rate_limit_reason or "") else "per_source"
+            RATE_LIMITED_REQUESTS.labels(source=alertmanager_source[:50], limit_type=limit_type).inc()
+            logger.warning(f"Rate limited alert '{alert_name}' from {alertmanager_source}: {rate_limit_reason}")
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "status": "rate_limited",
+                    "message": rate_limit_reason,
+                    "alert_name": alert_name,
+                    "source": alertmanager_source
+                }
+            )
+
     alert_time = str(time.time())
     alerts_list = body.get("alerts", [])
     if alerts_list and alerts_list[0].get("startsAt"):
-         alert_time = alerts_list[0].get("startsAt")
+        alert_time = alerts_list[0].get("startsAt")
+
+    # Check deduplication before triggering Rundeck
+    alert_labels = body.get("commonLabels", {}).copy()
+    alertmanager_url = extract_alertmanager_url(body.get("externalURL") or body.get("client_url"))
+    
+    # Audit log - alert received
+    audit_logger = get_audit_logger()
+    audit_logger.log_alert_received(alert_name, alert_labels, alertmanager_url)
+    
+    if remediation_manager:
+        should_skip, skip_reason, existing_workflow_id = await remediation_manager.check_deduplication(
+            alert_name, alert_labels
+        )
+        if should_skip:
+            reason_label = "active_workflow" if existing_workflow_id else "cooldown_or_limit"
+            ALERTS_DEDUPLICATED.labels(alert_type=alert_name, reason=reason_label).inc()
+            logger.info(f"Alert '{alert_name}' deduplicated: {skip_reason}")
+            
+            # Audit log - deduplication
+            audit_logger.log_alert_deduplicated(alert_name, alert_labels, skip_reason, existing_workflow_id)
+            
+            return {
+                "status": "deduplicated",
+                "message": skip_reason,
+                "existing_workflow_id": existing_workflow_id
+            }
+        
+        # Check circuit breaker for Rundeck
+        is_allowed, cb_reason = remediation_manager.check_circuit_breaker("rundeck")
+        if not is_allowed:
+            CIRCUIT_BREAKER_TRIPS.labels(service="rundeck").inc()
+            logger.warning(f"Rundeck circuit breaker open for alert '{alert_name}': {cb_reason}")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "circuit_breaker_open",
+                    "message": cb_reason,
+                    "alert_name": alert_name
+                }
+            )
 
     try:
         execution_info = await processor.send_to_webhook(alert_name, processed_alert, alert_time)
+        # Record success for circuit breaker
+        if remediation_manager:
+            remediation_manager.record_circuit_success("rundeck")
     except Exception as e:
+        # Record failure for circuit breaker
+        if remediation_manager:
+            remediation_manager.record_circuit_failure("rundeck")
         logger.error(f"Error sending to webhook: {e}")
         logger.error(f"Failed to send processed payload for alert '{alert_name}':\n{json.dumps(processed_alert, indent=2)}")
         return JSONResponse(status_code=500, content={"error": f"Error sending to webhook: {e}"})
@@ -370,16 +549,6 @@ async def receive_alert(request: Request):
     workflow_id = None
     if remediation_manager and app_config.is_remediation_enabled():
         try:
-            # Get alert labels for matching later
-            alert_labels = body.get("commonLabels", {}).copy()
-            
-            # Extract Alertmanager URL from externalURL for global service mode
-            # externalURL format: "http://alertmanager.eu-west-1.hunters.ai"
-            # Fallback to client_url if externalURL is not present (for compatibility)
-            alertmanager_url = extract_alertmanager_url(
-                body.get("externalURL") or body.get("client_url")
-            )
-            
             workflow_id = await remediation_manager.start_remediation(
                 alert_name=alert_name,
                 alert_labels=alert_labels,
@@ -389,6 +558,12 @@ async def receive_alert(request: Request):
             )
             REMEDIATION_WORKFLOWS.labels(alert_type=alert_name).inc()
             logger.info(f"Started remediation workflow: {workflow_id} (AM: {alertmanager_url})")
+            
+            # Audit log - workflow started
+            audit_logger.log_workflow_started(
+                workflow_id, alert_name, alert_labels,
+                execution_info["execution_id"], alertmanager_url
+            )
         except Exception as e:
             # Don't fail the request if remediation tracking fails
             logger.error(f"Failed to start remediation tracking: {e}")
@@ -424,8 +599,26 @@ async def get_remediation(workflow_id: str):
     return workflow
 
 
-if __name__ == "__main__":
+@app.get("/api/v1/rate-limits")
+async def get_rate_limits():
+    """Get rate limiter statistics for debugging."""
+    if not rate_limiter:
+        return {"enabled": False, "message": "Rate limiting not configured"}
+    
+    stats = rate_limiter.get_stats()
+    return {
+        "enabled": True,
+        "stats": stats
+    }
+
+
+def run_server():
+    """Run the server with uvicorn."""
     import uvicorn
     port = int(os.getenv("PORT", 8080))
     logger.info(f"Starting server on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+if __name__ == "__main__":
+    run_server()

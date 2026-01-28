@@ -12,6 +12,19 @@ remediation:
   poll_interval_seconds: 30
   resolution_wait_minutes: 5
   max_job_wait_minutes: 30
+  # P1: Cooldown between remediation attempts for same alert
+  cooldown_minutes: 5
+  # P2: Concurrent workflow limits
+  max_concurrent_workflows: 100
+  # P0: Circuit breaker settings
+  circuit_breaker_failure_threshold: 5
+  circuit_breaker_recovery_seconds: 60
+  # P3: Rate limiting settings
+  rate_limit_enabled: true
+  rate_limit_per_source_rate: 10.0  # requests/sec per Alertmanager
+  rate_limit_per_source_burst: 50
+  rate_limit_global_rate: 100.0     # total requests/sec
+  rate_limit_global_burst: 500
 
 state_store:
   type: "dynamodb"

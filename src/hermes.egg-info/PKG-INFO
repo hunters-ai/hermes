@@ -1,3 +1,36 @@
+Metadata-Version: 2.4
+Name: hermes
+Version: 1.0.0
+Summary: Swift messenger for automated alert remediation
+Author-email: SRE Team <sre@hunters.ai>
+License: MIT
+Project-URL: Homepage, https://github.com/hunters-ai/alterdeck
+Project-URL: Documentation, https://github.com/hunters-ai/alterdeck#readme
+Project-URL: Repository, https://github.com/hunters-ai/alterdeck
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.100.0
+Requires-Dist: uvicorn>=0.23.0
+Requires-Dist: httpx>=0.24.0
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: prometheus-client>=0.17.0
+Requires-Dist: boto3>=1.28.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.21.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.1.0; extra == "dev"
+Requires-Dist: black>=23.0.0; extra == "dev"
+Requires-Dist: isort>=5.12.0; extra == "dev"
+Requires-Dist: mypy>=1.5.0; extra == "dev"
+Requires-Dist: ruff>=0.0.290; extra == "dev"
+
 # Hermes
 
 **Hermes** - Swift messenger for automated alert remediation. Named after the Greek god known for speed and as the messenger of the gods.
@@ -228,39 +261,37 @@ routes:
 ### Setup
 
 ```bash
-# Create virtual environment and install with dev dependencies (using uv)
-uv venv
-uv pip install -e ".[dev]"
-
-# Or with pip
+# Create virtual environment
 python -m venv .venv
 source .venv/bin/activate
+
+# Install with dev dependencies
 pip install -e ".[dev]"
 ```
 
 ### Running Tests
 
 ```bash
-# Run all tests (using uv)
-uv run pytest
+# Run all tests
+pytest
 
 # Run with coverage
-uv run pytest --cov=hermes --cov-report=html
+pytest --cov=hermes --cov-report=html
 
 # Run specific test file
-uv run pytest tests/test_circuit_breaker.py -v
+pytest tests/test_circuit_breaker.py -v
 ```
 
 ### Code Quality
 
 ```bash
 # Format code
-uv run black src tests
-uv run isort src tests
+black src tests
+isort src tests
 
 # Lint
-uv run ruff check src tests
+ruff check src tests
 
 # Type checking
-uv run mypy src
+mypy src
 ```

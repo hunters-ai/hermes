@@ -1,7 +1,8 @@
 """Rundeck job monitoring client."""
 import logging
 from typing import Optional, Dict, Any, Tuple
-from rundeck_client import RundeckClient
+
+from hermes.clients.rundeck import RundeckClient
 
 logger = logging.getLogger(__name__)
 

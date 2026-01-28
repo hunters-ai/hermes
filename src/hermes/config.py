@@ -1,3 +1,8 @@
+"""
+Configuration models for Hermes.
+
+Handles loading and validation of configuration from YAML files.
+"""
 import yaml
 import os
 from typing import Dict, List, Optional
@@ -25,6 +30,16 @@ class RemediationConfig(BaseModel):
     resolution_wait_minutes: int = Field(default=5, description="Wait time after job success before checking alert")
     max_job_wait_minutes: int = Field(default=30, description="Timeout for job completion")
     alert_check_interval_seconds: int = Field(default=30, description="How often to poll Alertmanager during resolution wait")
+    cooldown_minutes: int = Field(default=5, description="Minimum time between remediation attempts for same alert")
+    max_concurrent_workflows: int = Field(default=100, description="Maximum number of concurrent remediation workflows")
+    circuit_breaker_failure_threshold: int = Field(default=5, description="Number of failures before opening circuit breaker")
+    circuit_breaker_recovery_seconds: int = Field(default=60, description="Time to wait before retrying after circuit breaker opens")
+    # Rate limiting
+    rate_limit_enabled: bool = Field(default=True, description="Enable rate limiting per Alertmanager source")
+    rate_limit_per_source_rate: float = Field(default=10.0, description="Requests per second per Alertmanager")
+    rate_limit_per_source_burst: int = Field(default=50, description="Max burst per Alertmanager")
+    rate_limit_global_rate: float = Field(default=100.0, description="Total requests per second")
+    rate_limit_global_burst: int = Field(default=500, description="Total max burst")
 
 
 class StateStoreConfig(BaseModel):
@@ -76,6 +91,7 @@ class RundeckConfig(BaseModel):
 
 
 class Config(BaseModel):
+    """Main configuration container."""
     # Rundeck settings - support both old format and new nested format
     auth_token: Optional[str] = Field(default=None, alias="auth_token")
     base_url: Optional[str] = Field(default=None, alias="base_url")
@@ -124,18 +140,11 @@ class Config(BaseModel):
         In global service mode, Alertmanager URL is extracted from the alert's
         client_url field, so static alertmanager config is optional.
         """
-        # Remediation is enabled if we have either:
-        # 1. A static alertmanager configured, OR
-        # 2. We trust that alerts will include client_url (global service mode)
         return True  # Always enable - we get Alertmanager URL from alert payload
 
     def create_rundeck_client(self):
-        """Create a RundeckClient instance based on configuration.
-        
-        Uses session-based auth if username/password are provided,
-        otherwise falls back to token-based auth.
-        """
-        from rundeck_client import RundeckClient
+        """Create a RundeckClient instance based on configuration."""
+        from hermes.clients.rundeck import RundeckClient
         
         if self.rundeck:
             return RundeckClient(
@@ -156,11 +165,12 @@ class Config(BaseModel):
 
 
 def load_alert_config(filename: str) -> Config:
+    """Load configuration from a YAML file."""
     try:
         with open(filename, 'r') as f:
             data = yaml.safe_load(f)
         
-        # Manually handle the alert configs to set default fields_location if missing
+        # Handle the alert configs to set default fields_location if missing
         if 'alerts' in data:
             for alert_name, alert_data in data['alerts'].items():
                 if 'fields_location' not in alert_data:

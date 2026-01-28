@@ -1,19 +1,69 @@
-"""Remediation manager - orchestrates the full remediation lifecycle."""
+"""
+Remediation manager - orchestrates the full remediation lifecycle.
+
+This is the core orchestration component that:
+1. Tracks triggered Rundeck jobs
+2. Polls for job completion
+3. Waits configured time after success
+4. Checks if alert is resolved via Alertmanager
+5. Updates JIRA with results
+6. Escalates to Slack if remediation failed
+"""
 import asyncio
 import logging
 import uuid
-from typing import Dict, Any, Optional
-from datetime import datetime
+from typing import Dict, Any, Optional, Tuple, Callable
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field
 
-from config import Config
-from state_store import StateStore, RemediationWorkflow, RemediationState
-from job_monitor import JobMonitor
-from alertmanager_client import AlertmanagerClient
-from rundeck_client import RundeckClient
-from jira_client import JiraClient
-from slack_client import SlackClient
+from hermes.config import Config
+from hermes.core.state_store import StateStore, RemediationWorkflow, RemediationState
+from hermes.core.job_monitor import JobMonitor
+from hermes.clients.alertmanager import AlertmanagerClient
+from hermes.clients.rundeck import RundeckClient
+from hermes.clients.jira import JiraClient
+from hermes.clients.slack import SlackClient
+
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CircuitBreakerState:
+    """Track circuit breaker state for external services."""
+    failures: int = 0
+    last_failure: Optional[datetime] = None
+    is_open: bool = False
+    
+    def record_failure(self):
+        self.failures += 1
+        self.last_failure = datetime.utcnow()
+    
+    def record_success(self):
+        self.failures = 0
+        self.is_open = False
+    
+    def should_allow_request(self, failure_threshold: int = 5, recovery_timeout_seconds: int = 60) -> bool:
+        """Check if request should be allowed based on circuit state."""
+        if self.failures < failure_threshold:
+            return True
+        
+        if self.last_failure and (datetime.utcnow() - self.last_failure).total_seconds() > recovery_timeout_seconds:
+            # Allow one request to test if service recovered
+            return True
+        
+        return False
+
+
+@dataclass  
+class AlertCooldown:
+    """Track cooldown state for alert deduplication."""
+    last_triggered: datetime
+    workflow_id: str
+
+
+# Metrics callback type for recording outcomes
+MetricsCallback = Callable[[str, str], None]  # (alert_name, outcome) -> None
 
 
 class RemediationManager:
@@ -27,12 +77,44 @@ class RemediationManager:
     6. Escalate to Slack if remediation failed
     """
     
-    def __init__(self, config: Config, state_store: StateStore, rundeck_client: RundeckClient):
+    # Default circuit breaker settings (can be overridden by config)
+    DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 5
+    DEFAULT_CIRCUIT_RECOVERY_TIMEOUT = 60  # seconds
+    
+    # Default concurrent workflow limits (can be overridden by config)
+    DEFAULT_MAX_CONCURRENT_WORKFLOWS = 100
+    DEFAULT_MAX_WORKFLOWS_PER_ALERT = 3
+    
+    def __init__(
+        self, 
+        config: Config, 
+        state_store: StateStore, 
+        rundeck_client: RundeckClient,
+        metrics_callback: Optional[MetricsCallback] = None
+    ):
         self.config = config
         self.state_store = state_store
         
+        # Get limits from config or use defaults
+        self.max_concurrent_workflows = getattr(
+            config.remediation, 'max_concurrent_workflows', 
+            self.DEFAULT_MAX_CONCURRENT_WORKFLOWS
+        )
+        self.circuit_failure_threshold = getattr(
+            config.remediation, 'circuit_breaker_failure_threshold',
+            self.DEFAULT_CIRCUIT_FAILURE_THRESHOLD
+        )
+        self.circuit_recovery_timeout = getattr(
+            config.remediation, 'circuit_breaker_recovery_seconds',
+            self.DEFAULT_CIRCUIT_RECOVERY_TIMEOUT
+        )
+        
+        # Metrics callback for recording outcomes
+        self._metrics_callback = metrics_callback
+        
         # Use shared client
         self.job_monitor = JobMonitor(rundeck_client)
+        self.rundeck_client = rundeck_client
         
         self.alertmanager_client = None
         if config.alertmanager:
@@ -62,6 +144,109 @@ class RemediationManager:
         self._running_tasks: Dict[str, asyncio.Task] = {}
         # Track resolution events for early termination via webhook
         self._resolution_events: Dict[str, asyncio.Event] = {}
+        
+        # Circuit breakers for external services
+        self._circuit_breakers: Dict[str, CircuitBreakerState] = {
+            "rundeck": CircuitBreakerState(),
+            "alertmanager": CircuitBreakerState(),
+            "jira": CircuitBreakerState(),
+            "slack": CircuitBreakerState(),
+        }
+        
+        # Alert cooldown tracking (alert_fingerprint -> cooldown state)
+        self._alert_cooldowns: Dict[str, AlertCooldown] = {}
+        
+        # Rate limiting per Alertmanager source
+        self._rate_limiters: Dict[str, Any] = {}
+    
+    def _get_alert_fingerprint(self, alert_name: str, alert_labels: Dict[str, str]) -> str:
+        """Generate a unique fingerprint for an alert based on name and key labels."""
+        # Sort labels for consistent fingerprint
+        sorted_labels = sorted(alert_labels.items())
+        label_str = ",".join(f"{k}={v}" for k, v in sorted_labels)
+        return f"{alert_name}:{label_str}"
+    
+    async def check_deduplication(
+        self, 
+        alert_name: str, 
+        alert_labels: Dict[str, str]
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """
+        Check if this alert should be deduplicated (skipped).
+        
+        Returns:
+            Tuple of (should_skip, reason, existing_workflow_id)
+        """
+        fingerprint = self._get_alert_fingerprint(alert_name, alert_labels)
+        
+        # Check 1: Is there an active workflow for this exact alert?
+        existing_workflow = await self.state_store.get_by_alert_labels(alert_name, alert_labels)
+        if existing_workflow:
+            return (
+                True, 
+                f"Active workflow {existing_workflow.id} already exists for this alert",
+                existing_workflow.id
+            )
+        
+        # Check 2: Is this alert in cooldown period?
+        cooldown_config = getattr(self.config.remediation, 'cooldown_minutes', 5)
+        if fingerprint in self._alert_cooldowns:
+            cooldown = self._alert_cooldowns[fingerprint]
+            elapsed = (datetime.utcnow() - cooldown.last_triggered).total_seconds() / 60
+            if elapsed < cooldown_config:
+                return (
+                    True,
+                    f"Alert in cooldown ({elapsed:.1f}/{cooldown_config} minutes), last workflow: {cooldown.workflow_id}",
+                    cooldown.workflow_id
+                )
+        
+        # Check 3: Have we hit the concurrent workflow limit?
+        if len(self._running_tasks) >= self.max_concurrent_workflows:
+            return (
+                True,
+                f"Max concurrent workflows ({self.max_concurrent_workflows}) reached",
+                None
+            )
+        
+        return (False, None, None)
+    
+    def check_circuit_breaker(self, service: str) -> Tuple[bool, str]:
+        """
+        Check if circuit breaker allows request to service.
+        
+        Returns:
+            Tuple of (is_allowed, reason)
+        """
+        if service not in self._circuit_breakers:
+            return (True, "")
+        
+        cb = self._circuit_breakers[service]
+        if cb.should_allow_request(self.circuit_failure_threshold, self.circuit_recovery_timeout):
+            return (True, "")
+        
+        return (False, f"Circuit breaker OPEN for {service} after {cb.failures} failures")
+    
+    def record_circuit_success(self, service: str):
+        """Record successful call to service."""
+        if service in self._circuit_breakers:
+            self._circuit_breakers[service].record_success()
+    
+    def record_circuit_failure(self, service: str):
+        """Record failed call to service."""
+        if service in self._circuit_breakers:
+            self._circuit_breakers[service].record_failure()
+            cb = self._circuit_breakers[service]
+            if cb.failures >= self.circuit_failure_threshold:
+                cb.is_open = True
+                logger.warning(f"Circuit breaker OPENED for {service} after {cb.failures} failures")
+    
+    def _record_outcome(self, alert_name: str, outcome: str):
+        """Record remediation outcome metric."""
+        if self._metrics_callback:
+            try:
+                self._metrics_callback(alert_name, outcome)
+            except Exception as e:
+                logger.warning(f"Failed to record metric: {e}")
     
     async def start_remediation(
         self,
@@ -99,6 +284,13 @@ class RemediationManager:
         
         await self.state_store.save(workflow)
         logger.info(f"Started remediation workflow {workflow_id} for alert {alert_name}")
+        
+        # Record cooldown for this alert
+        fingerprint = self._get_alert_fingerprint(alert_name, alert_labels)
+        self._alert_cooldowns[fingerprint] = AlertCooldown(
+            last_triggered=datetime.utcnow(),
+            workflow_id=workflow_id
+        )
         
         # Start background monitoring task
         task = asyncio.create_task(self._monitor_workflow(workflow_id))
@@ -301,7 +493,6 @@ class RemediationManager:
         
         if alertmanager_url:
             # Use the Alertmanager that sent this alert (global service mode)
-            from alertmanager_client import AlertmanagerClient
             am_client = AlertmanagerClient(alertmanager_url)
         elif self.alertmanager_client:
             # Fall back to configured default
@@ -329,6 +520,9 @@ class RemediationManager:
         
         logger.info(f"Remediation successful for {workflow.alert_name}")
         
+        # Record success metric
+        self._record_outcome(workflow.alert_name, "success")
+        
         # Update JIRA
         if self.jira_client and workflow.jira_ticket_id:
             try:
@@ -337,7 +531,9 @@ class RemediationManager:
                     workflow.alert_name,
                     workflow.rundeck_execution_url
                 )
+                self.record_circuit_success("jira")
             except Exception as e:
+                self.record_circuit_failure("jira")
                 logger.error(f"Failed to update JIRA: {e}")
         
         workflow.update_state(RemediationState.COMPLETED)
@@ -351,12 +547,18 @@ class RemediationManager:
         reason = "Rundeck job completed successfully but alert is still firing"
         logger.warning(f"Remediation incomplete for {workflow.alert_name}: {reason}")
         
+        # Record failure metric
+        self._record_outcome(workflow.alert_name, "alert_still_firing")
+        
         await self._escalate(workflow, reason)
     
     async def _handle_job_failure(self, workflow: RemediationWorkflow) -> None:
         """Handle Rundeck job failure."""
         reason = workflow.error_message or "Rundeck job execution failed"
         logger.warning(f"Job failed for {workflow.alert_name}: {reason}")
+        
+        # Record failure metric
+        self._record_outcome(workflow.alert_name, "job_failed")
         
         await self._escalate(workflow, reason)
     
@@ -432,6 +634,128 @@ class RemediationManager:
             }
             for w in workflows
         ]
+    
+    async def recover_active_workflows(self) -> int:
+        """
+        Recover active workflows from state store on startup.
+        
+        This handles the case where Hermes restarts mid-workflow.
+        Workflows are resumed based on their last known state.
+        
+        Returns:
+            Number of workflows recovered
+        """
+        recovered = 0
+        try:
+            active_workflows = await self.state_store.list_active()
+            
+            for workflow in active_workflows:
+                # Skip if already being monitored (shouldn't happen on fresh start)
+                if workflow.id in self._running_tasks:
+                    continue
+                
+                # Check how old this workflow is - skip if too old
+                age_hours = (datetime.utcnow() - workflow.created_at).total_seconds() / 3600
+                if age_hours > 24:  # Skip workflows older than 24 hours
+                    logger.warning(f"Skipping stale workflow {workflow.id} (age: {age_hours:.1f}h)")
+                    workflow.update_state(RemediationState.ESCALATED, "Workflow stale after restart")
+                    await self.state_store.save(workflow)
+                    continue
+                
+                # Re-populate cooldown tracking
+                fingerprint = self._get_alert_fingerprint(workflow.alert_name, workflow.alert_labels)
+                self._alert_cooldowns[fingerprint] = AlertCooldown(
+                    last_triggered=workflow.created_at,
+                    workflow_id=workflow.id
+                )
+                
+                # Resume monitoring based on state
+                if workflow.state in [
+                    RemediationState.JOB_TRIGGERED,
+                    RemediationState.JOB_RUNNING,
+                    RemediationState.JOB_SUCCEEDED,
+                    RemediationState.WAITING_RESOLUTION
+                ]:
+                    logger.info(f"Recovering workflow {workflow.id} in state {workflow.state.value}")
+                    
+                    # Create resolution event
+                    resolution_event = asyncio.Event()
+                    self._resolution_events[workflow.id] = resolution_event
+                    
+                    # Start monitoring task
+                    task = asyncio.create_task(self._resume_workflow(workflow))
+                    self._running_tasks[workflow.id] = task
+                    recovered += 1
+                else:
+                    logger.info(f"Workflow {workflow.id} in terminal state {workflow.state.value}, skipping recovery")
+            
+            return recovered
+            
+        except Exception as e:
+            logger.error(f"Error recovering workflows: {e}")
+            return recovered
+    
+    async def _resume_workflow(self, workflow: RemediationWorkflow) -> None:
+        """
+        Resume monitoring a recovered workflow based on its current state.
+        """
+        resolution_event = self._resolution_events.get(workflow.id)
+        if not resolution_event:
+            resolution_event = asyncio.Event()
+            self._resolution_events[workflow.id] = resolution_event
+        
+        try:
+            alert_config = self.config.get_alert_config(workflow.alert_name)
+            resolution_wait = self.config.remediation.resolution_wait_minutes
+            if alert_config and alert_config.remediation.resolution_wait_minutes:
+                resolution_wait = alert_config.remediation.resolution_wait_minutes
+            
+            # Resume based on state
+            if workflow.state in [RemediationState.JOB_TRIGGERED, RemediationState.JOB_RUNNING]:
+                # Re-check job completion
+                job_success = await self._wait_for_job_completion(workflow)
+                if not job_success:
+                    await self._handle_job_failure(workflow)
+                    return
+                
+                # Job succeeded, wait for resolution
+                workflow.update_state(RemediationState.WAITING_RESOLUTION)
+                await self.state_store.save(workflow)
+                
+                alert_resolved = await self._wait_for_alert_resolution(workflow, resolution_event, resolution_wait)
+                if alert_resolved:
+                    await self._handle_success(workflow)
+                else:
+                    await self._handle_alert_still_firing(workflow)
+                    
+            elif workflow.state == RemediationState.JOB_SUCCEEDED:
+                # Job already succeeded, just wait for resolution
+                workflow.update_state(RemediationState.WAITING_RESOLUTION)
+                await self.state_store.save(workflow)
+                
+                alert_resolved = await self._wait_for_alert_resolution(workflow, resolution_event, resolution_wait)
+                if alert_resolved:
+                    await self._handle_success(workflow)
+                else:
+                    await self._handle_alert_still_firing(workflow)
+                    
+            elif workflow.state == RemediationState.WAITING_RESOLUTION:
+                # Already waiting, continue polling
+                alert_resolved = await self._wait_for_alert_resolution(workflow, resolution_event, resolution_wait)
+                if alert_resolved:
+                    await self._handle_success(workflow)
+                else:
+                    await self._handle_alert_still_firing(workflow)
+                    
+        except asyncio.CancelledError:
+            logger.info(f"Recovered workflow {workflow.id} monitoring cancelled")
+        except Exception as e:
+            logger.exception(f"Error in recovered workflow {workflow.id}: {e}")
+            workflow.update_state(RemediationState.ESCALATED, str(e))
+            await self.state_store.save(workflow)
+        finally:
+            self._running_tasks.pop(workflow.id, None)
+            self._resolution_events.pop(workflow.id, None)
     
     async def shutdown(self) -> None:
         """Cancel all running workflow monitors."""

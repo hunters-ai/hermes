@@ -1,0 +1,2 @@
+[console_scripts]
+hermes = hermes.api.app:run_server

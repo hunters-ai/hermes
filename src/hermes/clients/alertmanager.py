@@ -2,7 +2,6 @@
 import logging
 from typing import Dict, List, Optional, Any
 import httpx
-from urllib.parse import urlencode
 
 logger = logging.getLogger(__name__)
 

@@ -90,7 +90,7 @@ class InMemoryStateStore(StateStore):
     """In-memory state store implementation.
     
     Note: State is lost on pod restart. Suitable for development/testing.
-    For production, consider RedisStateStore or PostgresStateStore.
+    For production, use DynamoDBStateStore.
     """
     
     def __init__(self):
@@ -162,10 +162,12 @@ class DynamoDBStateStore(StateStore):
     - Table name: configurable (default: hermes-workflows)
     - Partition key: id (String)
     - GSI: execution_id-index on rundeck_execution_id (String)
+    - GSI: alert_name-state-index on alert_name (String) and state (String)
     - TTL attribute: ttl (Number - Unix timestamp)
-    
-    TODO: Create DynamoDB table with Terraform/CloudFormation
     """
+    
+    EXECUTION_ID_INDEX = "execution_id-index"
+    ALERT_NAME_STATE_INDEX = "alert_name-state-index"
     
     def __init__(
         self, 
@@ -183,13 +185,9 @@ class DynamoDBStateStore(StateStore):
         self.table_name = table_name
         self.ttl_hours = ttl_hours
         
-        config = BotoConfig(
-            retries={'max_attempts': 3, 'mode': 'adaptive'}
-        )
-        
+        config = BotoConfig(retries={'max_attempts': 3, 'mode': 'adaptive'})
         session = boto3.Session(region_name=region) if region else boto3.Session()
         
-        # Support custom endpoint for LocalStack
         if endpoint_url:
             self.dynamodb = session.resource('dynamodb', config=config, endpoint_url=endpoint_url)
             logger.info(f"Initialized DynamoDB state store with endpoint: {endpoint_url}")
@@ -213,7 +211,6 @@ class DynamoDBStateStore(StateStore):
             "ttl": ttl_timestamp
         }
         
-        # Add optional fields
         if workflow.rundeck_execution_id:
             item["rundeck_execution_id"] = workflow.rundeck_execution_id
         if workflow.rundeck_execution_url:
@@ -248,82 +245,68 @@ class DynamoDBStateStore(StateStore):
     
     async def save(self, workflow: RemediationWorkflow) -> None:
         """Save or update a workflow."""
-        import asyncio
         item = self._workflow_to_item(workflow)
-        
-        # Run in executor to avoid blocking
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: self.table.put_item(Item=item))
     
     async def get(self, workflow_id: str) -> Optional[RemediationWorkflow]:
         """Get a workflow by ID."""
-        import asyncio
         loop = asyncio.get_event_loop()
-        
         response = await loop.run_in_executor(
             None, 
             lambda: self.table.get_item(Key={"id": workflow_id})
         )
-        
         item = response.get("Item")
-        if not item:
-            return None
-        
-        return self._item_to_workflow(item)
+        return self._item_to_workflow(item) if item else None
     
     async def get_by_execution_id(self, execution_id: str) -> Optional[RemediationWorkflow]:
         """Get a workflow by Rundeck execution ID using GSI."""
-        import asyncio
         from boto3.dynamodb.conditions import Key
         
         loop = asyncio.get_event_loop()
-        
         response = await loop.run_in_executor(
             None,
             lambda: self.table.query(
-                IndexName="execution_id-index",
+                IndexName=self.EXECUTION_ID_INDEX,
                 KeyConditionExpression=Key("rundeck_execution_id").eq(execution_id)
             )
         )
-        
         items = response.get("Items", [])
-        if not items:
-            return None
-        
-        return self._item_to_workflow(items[0])
+        return self._item_to_workflow(items[0]) if items else None
     
     async def list_active(self) -> List[RemediationWorkflow]:
         """List all active (non-completed) workflows."""
-        import asyncio
         from boto3.dynamodb.conditions import Attr
         
         loop = asyncio.get_event_loop()
         completed_states = [RemediationState.COMPLETED.value, RemediationState.ALERT_RESOLVED.value]
+        active_states = [s.value for s in RemediationState if s.value not in completed_states]
         
-        # Scan with filter (okay for small datasets, use GSI for larger scale)
-        response = await loop.run_in_executor(
-            None,
-            lambda: self.table.scan(
-                FilterExpression=Attr("state").is_in(
-                    [s.value for s in RemediationState if s.value not in completed_states]
+        all_workflows = []
+        try:
+            for state in active_states:
+                response = await loop.run_in_executor(
+                    None,
+                    lambda s=state: self.table.scan(FilterExpression=Attr("state").eq(s))
                 )
+                all_workflows.extend(response.get("Items", []))
+        except Exception as e:
+            logger.warning(f"GSI query failed, falling back to scan: {e}")
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.table.scan(FilterExpression=Attr("state").is_in(active_states))
             )
-        )
+            all_workflows = response.get("Items", [])
         
-        return [self._item_to_workflow(item) for item in response.get("Items", [])]
+        return [self._item_to_workflow(item) for item in all_workflows]
     
     async def get_by_alert_labels(
         self, 
         alert_name: str, 
         alert_labels: Dict[str, str]
     ) -> Optional[RemediationWorkflow]:
-        """Get active workflow matching the alert name and labels.
-        
-        Note: This does a scan which is inefficient for large datasets.
-        For production scale, consider adding a GSI on alert_name.
-        """
-        import asyncio
-        from boto3.dynamodb.conditions import Attr
+        """Get active workflow matching the alert name and labels."""
+        from boto3.dynamodb.conditions import Key, Attr
         
         loop = asyncio.get_event_loop()
         completed_states = [
@@ -331,34 +314,41 @@ class DynamoDBStateStore(StateStore):
             RemediationState.ALERT_RESOLVED.value,
             RemediationState.ESCALATED.value
         ]
+        active_states = [s.value for s in RemediationState if s.value not in completed_states]
         
-        response = await loop.run_in_executor(
-            None,
-            lambda: self.table.scan(
-                FilterExpression=(
-                    Attr("alert_name").eq(alert_name) &
-                    Attr("state").is_in(
-                        [s.value for s in RemediationState if s.value not in completed_states]
+        try:
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.table.query(
+                    IndexName=self.ALERT_NAME_STATE_INDEX,
+                    KeyConditionExpression=Key("alert_name").eq(alert_name),
+                    FilterExpression=Attr("state").is_in(active_states)
+                )
+            )
+            items = response.get("Items", [])
+        except Exception as e:
+            logger.warning(f"GSI query failed for alert_name '{alert_name}', falling back to scan: {e}")
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.table.scan(
+                    FilterExpression=(
+                        Attr("alert_name").eq(alert_name) &
+                        Attr("state").is_in(active_states)
                     )
                 )
             )
-        )
+            items = response.get("Items", [])
         
-        # Check label matching in memory (DynamoDB doesn't support nested map queries well)
-        for item in response.get("Items", []):
+        for item in items:
             workflow = self._item_to_workflow(item)
             if all(workflow.alert_labels.get(k) == v for k, v in alert_labels.items()):
                 return workflow
-        
         return None
     
     async def delete(self, workflow_id: str) -> None:
         """Delete a workflow."""
-        import asyncio
         loop = asyncio.get_event_loop()
-        
         await loop.run_in_executor(
             None,
             lambda: self.table.delete_item(Key={"id": workflow_id})
         )
-
