@@ -277,13 +277,26 @@ class AlertProcessor:
                 logger.warning(f"Fields location '{fields_location}' not found or not a dict for alert '{alert_name}'")
                 source_map = {}
 
+        # Fallback to alerts[0].labels if field not found in primary location
+        alerts_labels = {}
+        if payload.get("alerts") and len(payload["alerts"]) > 0:
+            alerts_labels = payload["alerts"][0].get("labels", {})
+        
         for field in alert_config.required_fields:
+            value = None
             if field in source_map:
+                value = source_map[field]
+            elif field in alerts_labels:
+                # Fallback to alerts[0].labels
+                value = alerts_labels[field]
+                logger.info(f"Field '{field}' found in alerts[0].labels (fallback)")
+            
+            if value is not None:
                 target_field = alert_config.field_mappings.get(field, field)
-                logger.info(f"Mapping field '{field}' -> '{target_field}' with value '{source_map[field]}'")
-                result[target_field] = source_map[field]
+                logger.info(f"Mapping field '{field}' -> '{target_field}' with value '{value}'")
+                result[target_field] = value
             else:
-                logger.warning(f"Required field '{field}' not found in location '{fields_location}' for alert '{alert_name}'")
+                logger.warning(f"Required field '{field}' not found in location '{fields_location}' or alerts[0].labels for alert '{alert_name}'")
                 missing_fields.append(field)
 
         if missing_fields:
