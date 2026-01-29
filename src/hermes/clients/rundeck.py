@@ -131,8 +131,9 @@ class RundeckClient:
                 )
                 
                 # Handle session expiry - re-authenticate and retry
-                if response.status_code == 401 and self._use_session_auth and retry_on_auth_failure:
-                    logger.warning("Session expired, re-authenticating...")
+                # Rundeck returns 401 or 403 when session is expired/invalid
+                if response.status_code in (401, 403) and self._use_session_auth and retry_on_auth_failure:
+                    logger.warning(f"Session expired or unauthorized ({response.status_code}), re-authenticating...")
                     self._session_cookie = None
                     if await self._login():
                         return await self._request(method, endpoint, json_data, retry_on_auth_failure=False)
