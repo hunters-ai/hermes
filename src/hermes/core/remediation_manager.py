@@ -316,6 +316,9 @@ class RemediationManager:
             if alert_config and alert_config.remediation.resolution_wait_minutes:
                 resolution_wait = alert_config.remediation.resolution_wait_minutes
             
+            # Check if we should skip resolution check (for alerts requiring customer action)
+            skip_resolution_check = alert_config and alert_config.remediation.skip_resolution_check
+            
             # Step 1: Wait for job completion
             job_success = await self._wait_for_job_completion(workflow)
             
@@ -324,7 +327,13 @@ class RemediationManager:
                 await self._handle_job_failure(workflow)
                 return
             
-            # Step 2: Wait for alert resolution (with polling and early resolution support)
+            # Step 2: If skip_resolution_check is set, mark as success without waiting for alert resolution
+            if skip_resolution_check:
+                logger.info(f"Job succeeded, skipping resolution check for {workflow.alert_name} (customer action required)")
+                await self._handle_success_no_resolution_check(workflow)
+                return
+            
+            # Step 3: Wait for alert resolution (with polling and early resolution support)
             logger.info(f"Job succeeded, waiting up to {resolution_wait} minutes for alert resolution")
             workflow.update_state(RemediationState.WAITING_RESOLUTION)
             await self.state_store.save(workflow)
@@ -538,6 +547,21 @@ class RemediationManager:
         
         workflow.update_state(RemediationState.COMPLETED)
         await self.state_store.save(workflow)
+    
+    async def _handle_success_no_resolution_check(self, workflow: RemediationWorkflow) -> None:
+        """
+        Handle successful job execution when skip_resolution_check is enabled.
+        
+        Used for alerts that require customer action and won't auto-resolve.
+        We mark as completed without checking alert status or adding JIRA comments.
+        """
+        workflow.update_state(RemediationState.COMPLETED)
+        await self.state_store.save(workflow)
+        
+        logger.info(f"Job execution completed for {workflow.alert_name} (resolution check skipped)")
+        
+        # Record success metric with specific outcome
+        self._record_outcome(workflow.alert_name, "job_success_no_resolution_check")
     
     async def _handle_alert_still_firing(self, workflow: RemediationWorkflow) -> None:
         """Handle case where job succeeded but alert is still firing."""

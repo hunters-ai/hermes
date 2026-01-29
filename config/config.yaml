@@ -50,6 +50,22 @@ alerts:
     field_mappings:
       node: node_name
 
+  # FN Dataflow Internal Issues - requires customer action, so skip resolution check
+  'FN Dataflow Internal Issues':
+    fields_location: commonLabels
+    job_id: 6f037e9c-8342-49d3-b035-105b6e9abf77
+    remediation:
+      enabled: true
+      jira_ticket_option: jira_ticket
+      fetch_jira_ticket: true
+      jira_summary_search_field: dataflow_id
+      skip_resolution_check: true  # Alert won't auto-resolve, requires customer action
+    required_fields:
+      - dataflow_id
+      - cluster
+    field_mappings:
+      cluster: cluster_name
+
 slack:
   enabled: true
   noc_channel: "#alerts-sandbox" # Changed from nocChannel

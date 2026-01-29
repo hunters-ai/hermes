@@ -14,6 +14,12 @@ class AlertRemediationConfig(BaseModel):
     enabled: bool = Field(default=True)
     resolution_wait_minutes: Optional[int] = Field(default=None, description="Override global wait time")
     jira_ticket_option: str = Field(default="jira_ticket", description="Rundeck option name for JIRA ticket")
+    # JIRA ticket fetching - for alerts where ticket is created by jira-alert service
+    fetch_jira_ticket: bool = Field(default=False, description="Fetch JIRA ticket ID via JQL before triggering Rundeck")
+    jira_summary_search_field: Optional[str] = Field(default=None, description="Alert field to use for JIRA summary search (e.g., 'dataflow_id')")
+    # Skip alert resolution check - for alerts that won't auto-resolve (e.g., customer action required)
+    # When True: still monitors job execution and escalates on failure, but skips waiting for alert resolution
+    skip_resolution_check: bool = Field(default=False, description="Skip alert resolution check after job success (for alerts that require customer action)")
 
 
 class AlertConfig(BaseModel):

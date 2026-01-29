@@ -3,3 +3,4 @@
 testing/*
 *debug*
 .DS_Store
+.*egg*

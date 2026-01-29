@@ -20,6 +20,7 @@ from hermes.config import load_alert_config, Config
 from hermes.core.state_store import InMemoryStateStore, DynamoDBStateStore
 from hermes.core.remediation_manager import RemediationManager
 from hermes.clients.rundeck import RundeckClient
+from hermes.clients.jira import JiraClient
 from hermes.utils.audit_logger import get_audit_logger
 from hermes.utils.rate_limiter import RateLimiter
 
@@ -98,6 +99,11 @@ RATE_LIMITED_REQUESTS = Counter(
     "The total number of rate limited requests",
     ["source", "limit_type"]
 )
+JIRA_TICKET_FETCH = Counter(
+    "hermes_jira_ticket_fetch_total",
+    "The total number of JIRA ticket fetch attempts",
+    ["alert_type", "status"]
+)
 
 # Load Config
 CONFIG_PATH = os.getenv("CONFIG_PATH", "config/config.yaml")
@@ -126,6 +132,16 @@ def create_state_store(config: Config):
 
 state_store = create_state_store(app_config) if app_config else InMemoryStateStore()
 rundeck_client = app_config.create_rundeck_client() if app_config else None
+
+# Initialize JIRA client for ticket lookups
+jira_client: Optional[JiraClient] = None
+if app_config and app_config.jira:
+    jira_client = JiraClient(
+        base_url=app_config.jira.base_url,
+        user_email=app_config.jira.user_email,
+        api_token=app_config.jira.api_token
+    )
+    logger.info("JIRA client initialized for ticket lookups")
 
 
 def record_remediation_outcome(alert_name: str, outcome: str):
@@ -241,9 +257,10 @@ class AlertPayload(BaseModel):
 class AlertProcessor:
     """Processes incoming alerts and triggers Rundeck jobs."""
     
-    def __init__(self, config: Config, rundeck: RundeckClient):
+    def __init__(self, config: Config, rundeck: RundeckClient, jira: Optional[JiraClient] = None):
         self.config = config
         self.rundeck = rundeck
+        self.jira = jira
 
     def process_alert(self, payload: Dict[str, Any]) -> tuple:
         alert_name = payload.get("commonLabels", {}).get("alertname")
@@ -312,6 +329,15 @@ class AlertProcessor:
             PROCESSING_ERRORS.labels(error_type="config_not_found", alert_type=alert_name).inc()
             self._raise_error(f"no configuration found for alert: {alert_name}")
 
+        # Fetch JIRA ticket ID if configured
+        if alert_config.remediation.fetch_jira_ticket:
+            jira_ticket_id = await self._fetch_jira_ticket(alert_name, alert_config, payload)
+            if jira_ticket_id:
+                # Add ticket ID to payload using the configured option name
+                ticket_option_name = alert_config.remediation.jira_ticket_option
+                payload[ticket_option_name] = jira_ticket_id
+                logger.info(f"Added JIRA ticket {jira_ticket_id} to Rundeck options as '{ticket_option_name}'")
+
         logger.info(f"Sending to Rundeck job {alert_config.job_id} with options: {json.dumps(payload, indent=2)}")
         
         try:
@@ -333,11 +359,62 @@ class AlertProcessor:
             "execution_url": response_data.get("permalink") or response_data.get("href", "")
         }
 
+    async def _fetch_jira_ticket(
+        self, 
+        alert_name: str, 
+        alert_config, 
+        payload: Dict[str, Any]
+    ) -> Optional[str]:
+        """
+        Fetch JIRA ticket ID for alerts where ticket is created by jira-alert service.
+        
+        Uses the configured jira_summary_search_field to extract the search term
+        from the alert payload and finds the matching ticket via JQL.
+        """
+        if not self.jira:
+            logger.warning(f"JIRA client not configured, cannot fetch ticket for alert '{alert_name}'")
+            JIRA_TICKET_FETCH.labels(alert_type=alert_name, status="no_client").inc()
+            return None
+        
+        search_field = alert_config.remediation.jira_summary_search_field
+        if not search_field:
+            logger.warning(f"No jira_summary_search_field configured for alert '{alert_name}'")
+            JIRA_TICKET_FETCH.labels(alert_type=alert_name, status="no_search_field").inc()
+            return None
+        
+        # Get the search value from the processed payload
+        search_value = payload.get(search_field)
+        if not search_value:
+            # Try the original field name (before mapping)
+            for orig_field, mapped_field in alert_config.field_mappings.items():
+                if mapped_field == search_field:
+                    search_value = payload.get(orig_field)
+                    break
+        
+        if not search_value:
+            logger.warning(f"Search field '{search_field}' not found in payload for alert '{alert_name}'")
+            JIRA_TICKET_FETCH.labels(alert_type=alert_name, status="missing_search_value").inc()
+            return None
+        
+        try:
+            ticket_id = await self.jira.find_ticket_by_summary(summary_search_text=search_value)
+            if ticket_id:
+                JIRA_TICKET_FETCH.labels(alert_type=alert_name, status="found").inc()
+                logger.info(f"Found JIRA ticket {ticket_id} for alert '{alert_name}' (search: {search_value})")
+            else:
+                JIRA_TICKET_FETCH.labels(alert_type=alert_name, status="not_found").inc()
+                logger.warning(f"No JIRA ticket found for alert '{alert_name}' (search: {search_value})")
+            return ticket_id
+        except Exception as e:
+            JIRA_TICKET_FETCH.labels(alert_type=alert_name, status="error").inc()
+            logger.error(f"Error fetching JIRA ticket for alert '{alert_name}': {e}")
+            return None
+
     def _raise_error(self, message: str):
         raise ValueError(message)
 
 
-processor = AlertProcessor(app_config, rundeck_client) if app_config and rundeck_client else None
+processor = AlertProcessor(app_config, rundeck_client, jira_client) if app_config and rundeck_client else None
 
 
 @app.middleware("http")

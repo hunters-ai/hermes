@@ -1,6 +1,6 @@
 """JIRA API client for updating tickets and adding comments."""
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import httpx
 from base64 import b64encode
 
@@ -140,3 +140,87 @@ class JiraClient:
                     logger.warning(f"JIRA ticket {ticket_id} not found")
                     return None
                 raise
+    
+    async def search_tickets(
+        self, 
+        jql: str, 
+        max_results: int = 1,
+        fields: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for JIRA tickets using JQL.
+        
+        Args:
+            jql: JQL query string
+            max_results: Maximum number of results to return
+            fields: List of fields to return (defaults to key, summary)
+        
+        Returns:
+            List of matching tickets
+        """
+        url = f"{self.base_url}/rest/api/3/search"
+        
+        payload = {
+            "jql": jql,
+            "maxResults": max_results,
+            "fields": fields or ["key", "summary", "created"]
+        }
+        
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(url, headers=self._get_headers(), json=payload)
+                response.raise_for_status()
+                result = response.json()
+                issues = result.get("issues", [])
+                logger.info(f"JQL search returned {len(issues)} tickets (max: {max_results})")
+                return issues
+            except httpx.HTTPError as e:
+                logger.error(f"Error searching JIRA tickets: {e}")
+                if hasattr(e, 'response') and e.response is not None:
+                    logger.error(f"Response: {e.response.text}")
+                raise
+    
+    async def find_ticket_by_summary(
+        self, 
+        summary_search_text: str,
+        reporter_account_id: str = "712020:b70007c3-9e04-441b-bea0-2c3ef9cdb250",
+        hours_ago: int = 1
+    ) -> Optional[str]:
+        """
+        Find a JIRA ticket by summary text search.
+        
+        Used to find tickets created by jira-alert service for specific alerts.
+        
+        Args:
+            summary_search_text: Text to search for in ticket summary (e.g., dataflow_id)
+            reporter_account_id: JIRA account ID of the jira-alert service reporter
+            hours_ago: How far back to search (default 1 hour)
+        
+        Returns:
+            Ticket key (e.g., "OPS-1234") if found, None otherwise
+        """
+        # Build JQL query matching the NOC ticket pattern
+        jql = (
+            f'"Responsible Team" = "SRE-NOC" '
+            f'AND created > -{hours_ago}h '
+            f'AND labels in ("NOC", "ingestion-content") '
+            f'AND reporter = {reporter_account_id} '
+            f'AND summary ~ "{summary_search_text}" '
+            f'ORDER BY created DESC'
+        )
+        
+        logger.info(f"Searching JIRA for ticket with summary containing: {summary_search_text}")
+        logger.debug(f"JQL query: {jql}")
+        
+        try:
+            tickets = await self.search_tickets(jql, max_results=1)
+            if tickets:
+                ticket_key = tickets[0].get("key")
+                logger.info(f"Found JIRA ticket: {ticket_key}")
+                return ticket_key
+            else:
+                logger.warning(f"No JIRA ticket found for summary search: {summary_search_text}")
+                return None
+        except Exception as e:
+            logger.error(f"Failed to find JIRA ticket for '{summary_search_text}': {e}")
+            return None
