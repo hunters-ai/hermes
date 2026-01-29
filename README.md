@@ -142,6 +142,8 @@ All fields under `remediation` block are optional:
 | `fetch_jira_ticket` | bool | `false` | Query JIRA for ticket ID before triggering Rundeck (for alerts created by jira-alert service) |
 | `jira_summary_search_field` | string | `null` | Alert field to use in JIRA summary search (e.g., `"dataflow_id"`) |
 | `skip_resolution_check` | bool | `false` | Skip checking Alertmanager after job succeeds (for alerts requiring customer action) |
+| `send_alert_payload` | bool | `false` | **NEW**: Send full alert context as JSON string to Rundeck job for debugging/JIRA comments |
+| `alert_payload_option_name` | string | `"alert_payload"` | Rundeck job option name to receive the alert payload JSON string |
 
 ### Example Configurations
 
@@ -158,6 +160,55 @@ All fields under `remediation` block are optional:
   remediation:
     enabled: true
     job_retrigger_cooldown_minutes: 2  # Retry faster for critical infra
+```
+
+**Alert with full payload forwarding (for debugging/JIRA comments):**
+```yaml
+'Node NotReady':
+  job_id: "4d47bff5-c549-48da-9aad-d5ac0619fc94"
+  fields_location: "commonLabels"
+  required_fields:
+    - "node"
+    - "cluster"
+    - "region"
+  remediation:
+    enabled: true
+    send_alert_payload: true              # Send full alert context to Rundeck
+    alert_payload_option_name: "alert_payload"  # Rundeck option name
+```
+
+The alert payload JSON includes:
+- `alert_name`: Alert name
+- `alert_labels`: All alert labels
+- `alert_time`: When alert fired
+- `source_alertmanager`: Source Alertmanager URL
+- `processed_options`: Extracted required fields
+
+Example payload structure:
+```json
+{
+  "alert_name": "Node is in NotReady state for 30 minutes",
+  "alert_labels": {
+    "alertname": "Node is in NotReady state for 30 minutes",
+    "cluster": "eu-west-1-prod",
+    "node": "ip-172-26-75-139.eu-west-1.compute.internal",
+    "region": "eu-west-1",
+    "severity": "warning"
+  },
+  "alert_time": "2026-01-29T11:46:48Z",
+  "source_alertmanager": "https://alertmanager.eu-west-1.hunters.ai",
+  "processed_options": {
+    "node": "ip-172-26-75-139",
+    "cluster": "eu-west-1-prod"
+  }
+}
+```
+
+In your Rundeck job script, parse the JSON:
+```python
+import json
+alert_payload = json.loads("${option.alert_payload}")
+print(f"Remediating alert: {alert_payload['alert_name']}")
 ```
 
 **Alert with JIRA ticket lookup:**

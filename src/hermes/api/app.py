@@ -25,14 +25,13 @@ from hermes.utils.audit_logger import get_audit_logger
 from hermes.utils.rate_limiter import RateLimiter
 
 
-# Filter to exclude health check logs
+# Filter to exclude health check logs, becaue its spammy and clogs the stdout
 class HealthCheckFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
         return 'GET /health' not in message and 'HEAD /health' not in message
 
 
-# Initialize logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -105,7 +104,6 @@ JIRA_TICKET_FETCH = Counter(
     ["alert_type", "status"]
 )
 
-# Load Config
 CONFIG_PATH = os.getenv("CONFIG_PATH", "config/config.yaml")
 try:
     if not os.path.exists(CONFIG_PATH):
@@ -116,7 +114,7 @@ except Exception as e:
     logger.error(f"Failed to load configuration: {e}")
     app_config = None
 
-
+# Initialize state store, its used to track active remediation workflows as persistant state store
 def create_state_store(config: Config):
     """Create state store based on configuration."""
     if config.state_store.type == "dynamodb":
@@ -156,7 +154,8 @@ remediation_manager = RemediationManager(
     metrics_callback=record_remediation_outcome
 ) if app_config and rundeck_client else None
 
-# Initialize rate limiter based on config
+#TODO: this needs to be adjusted
+# Initialize rate limiter based on config, this needs to be adjusted
 rate_limiter: Optional[RateLimiter] = None
 if app_config and getattr(app_config.remediation, 'rate_limit_enabled', True):
     rate_limiter = RateLimiter(
@@ -205,13 +204,12 @@ def extract_alertmanager_url(client_url: Optional[str]) -> Optional[str]:
     
     try:
         parsed = urlparse(client_url)
-        # Reconstruct with just scheme, netloc (host:port)
         base_url = urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
         
         if not base_url:
             return None
             
-        # Convert HTTP to HTTPS for external hunters.ai URLs
+        # Convert HTTP to HTTPS for external hunters.ai URLs because alertmanager sends payload with http 
         if "hunters.ai" in parsed.netloc and parsed.scheme == "http":
             parsed = parsed._replace(scheme="https")
             base_url = urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
@@ -265,6 +263,7 @@ class AlertProcessor:
     def process_alert(self, payload: Dict[str, Any]) -> tuple:
         alert_name = payload.get("commonLabels", {}).get("alertname")
         
+        #fallback
         if not alert_name and payload.get("alerts"):
             alert_name = payload["alerts"][0].get("labels", {}).get("alertname")
 
@@ -322,7 +321,7 @@ class AlertProcessor:
         
         return result, alert_name, missing_fields
 
-    async def send_to_webhook(self, alert_name: str, payload: Dict[str, Any], alert_time: str) -> Dict[str, Any]:
+    async def send_to_webhook(self, alert_name: str, payload: Dict[str, Any], alert_time: str, full_alert_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Send to Rundeck and return execution details."""
         alert_config = self.config.get_alert_config(alert_name)
         if not alert_config:
@@ -337,6 +336,13 @@ class AlertProcessor:
                 ticket_option_name = alert_config.remediation.jira_ticket_option
                 payload[ticket_option_name] = jira_ticket_id
                 logger.info(f"Added JIRA ticket {jira_ticket_id} to Rundeck options as '{ticket_option_name}'")
+
+        # Send full alert payload if configured
+        if alert_config.remediation.send_alert_payload and full_alert_context:
+            payload_option_name = alert_config.remediation.alert_payload_option_name
+            # Convert alert context to JSON string
+            payload[payload_option_name] = json.dumps(full_alert_context, default=str)
+            logger.info(f"Added full alert payload to Rundeck options as '{payload_option_name}'")
 
         logger.info(f"Sending to Rundeck job {alert_config.job_id} with options: {json.dumps(payload, indent=2)}")
         
@@ -626,8 +632,17 @@ async def receive_alert(request: Request):
                 }
             )
 
+    # Prepare full alert context for audit logging and optional Rundeck payload
+    full_alert_context = {
+        "alert_name": alert_name,
+        "alert_labels": alert_labels,
+        "alert_time": alert_time,
+        "source_alertmanager": alertmanager_url,
+        "processed_options": processed_alert
+    }
+
     try:
-        execution_info = await processor.send_to_webhook(alert_name, processed_alert, alert_time)
+        execution_info = await processor.send_to_webhook(alert_name, processed_alert, alert_time, full_alert_context)
         # Record success for circuit breaker
         if remediation_manager:
             remediation_manager.record_circuit_success("rundeck")
@@ -655,10 +670,10 @@ async def receive_alert(request: Request):
             REMEDIATION_WORKFLOWS.labels(alert_type=alert_name).inc()
             logger.info(f"Started remediation workflow: {workflow_id} (AM: {alertmanager_url})")
             
-            # Audit log - workflow started
+            # Audit log - workflow started with execution URL
             audit_logger.log_workflow_started(
                 workflow_id, alert_name, alert_labels,
-                execution_info["execution_id"], alertmanager_url
+                execution_info["execution_url"], alertmanager_url
             )
         except Exception as e:
             # Don't fail the request if remediation tracking fails

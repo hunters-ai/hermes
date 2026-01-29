@@ -21,6 +21,9 @@ class AlertRemediationConfig(BaseModel):
     # Skip alert resolution check - for alerts that won't auto-resolve (e.g., customer action required)
     # When True: still monitors job execution and escalates on failure, but skips waiting for alert resolution
     skip_resolution_check: bool = Field(default=False, description="Skip alert resolution check after job success (for alerts that require customer action)")
+    # Alert payload forwarding - send full alert context to Rundeck job
+    send_alert_payload: bool = Field(default=False, description="Send full alert payload as JSON string to Rundeck job")
+    alert_payload_option_name: str = Field(default="alert_payload", description="Rundeck option name for alert payload JSON")
 
 
 class AlertConfig(BaseModel):

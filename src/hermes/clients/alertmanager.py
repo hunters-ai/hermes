@@ -31,8 +31,6 @@ class AlertmanagerClient:
         """
         url = f"{self.base_url}/api/v2/alerts"
         
-        # Alertmanager API v2 uses multiple 'filter' query params
-        # Format: ?filter=alertname="value"&filter=severity="critical"
         query_params = []
         if label_matchers:
             for key, value in label_matchers.items():

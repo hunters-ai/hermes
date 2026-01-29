@@ -135,7 +135,7 @@ class AuditLogger:
         workflow_id: str,
         alert_name: str,
         alert_labels: Dict[str, str],
-        rundeck_execution_id: str,
+        rundeck_execution_url: str,
         source_alertmanager: Optional[str] = None
     ):
         """Log when a remediation workflow is started."""
@@ -144,9 +144,11 @@ class AuditLogger:
             workflow_id=workflow_id,
             alert_name=alert_name,
             alert_labels=alert_labels,
-            rundeck_execution_id=rundeck_execution_id,
             source_alertmanager=source_alertmanager,
-            details={"state": "job_triggered"}
+            details={
+                "state": "job_triggered",
+                "rundeck_execution_url": rundeck_execution_url
+            }
         )
         self._log_event(event)
     

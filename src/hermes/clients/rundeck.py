@@ -11,6 +11,8 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+#TODO: figure out how to get API token with no expiration so that we can deprecate session auth, its bad and ugly
+
 class RundeckClient:
     """Async Rundeck API client with automatic session management."""
     

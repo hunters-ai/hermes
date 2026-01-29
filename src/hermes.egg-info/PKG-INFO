@@ -261,37 +261,39 @@ routes:
 ### Setup
 
 ```bash
-# Create virtual environment
+# Create virtual environment and install with dev dependencies (using uv)
+uv venv
+uv pip install -e ".[dev]"
+
+# Or with pip
 python -m venv .venv
 source .venv/bin/activate
-
-# Install with dev dependencies
 pip install -e ".[dev]"
 ```
 
 ### Running Tests
 
 ```bash
-# Run all tests
-pytest
+# Run all tests (using uv)
+uv run pytest
 
 # Run with coverage
-pytest --cov=hermes --cov-report=html
+uv run pytest --cov=hermes --cov-report=html
 
 # Run specific test file
-pytest tests/test_circuit_breaker.py -v
+uv run pytest tests/test_circuit_breaker.py -v
 ```
 
 ### Code Quality
 
 ```bash
 # Format code
-black src tests
-isort src tests
+uv run black src tests
+uv run isort src tests
 
 # Lint
-ruff check src tests
+uv run ruff check src tests
 
 # Type checking
-mypy src
+uv run mypy src
 ```

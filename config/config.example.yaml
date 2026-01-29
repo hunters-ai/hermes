@@ -57,3 +57,18 @@ alerts:
     remediation:
       enabled: true
       resolution_wait_minutes: 5
+
+  # Example with alert payload forwarding enabled
+  NodeNotReady:
+    job_id: "node-remediation-job-id"
+    required_fields:
+      - "cluster"
+      - "node"
+      - "region"
+    fields_location: "commonLabels"
+    remediation:
+      enabled: true
+      resolution_wait_minutes: 5
+      # Send full alert payload as JSON string to Rundeck job
+      send_alert_payload: true
+      alert_payload_option_name: "alert_payload" # Rundeck option name to receive the JSON

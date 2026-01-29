@@ -125,7 +125,7 @@ class TestAuditLogger:
                 workflow_id="wf-123",
                 alert_name="TestAlert",
                 alert_labels={"cluster": "prod"},
-                rundeck_execution_id="exec-456",
+                rundeck_execution_url="https://rundeck.example.com/project/ops/execution/show/456",
                 source_alertmanager="http://alertmanager.example.com"
             )
             
@@ -134,7 +134,7 @@ class TestAuditLogger:
             
             assert event["event_type"] == "workflow_started"
             assert event["workflow_id"] == "wf-123"
-            assert event["rundeck_execution_id"] == "exec-456"
+            assert event["details"]["rundeck_execution_url"] == "https://rundeck.example.com/project/ops/execution/show/456"
     
     def test_log_job_completed_success(self, audit_logger):
         """Should log job completed with success status."""
