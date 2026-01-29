@@ -589,8 +589,14 @@ async def receive_alert(request: Request):
     audit_logger.log_alert_received(alert_name, alert_labels, alertmanager_url)
     
     if remediation_manager:
+        # Get per-alert cooldown override if configured
+        alert_config = app_config.get_alert_config(alert_name) if app_config else None
+        alert_cooldown = None
+        if alert_config and alert_config.remediation and alert_config.remediation.job_retrigger_cooldown_minutes is not None:
+            alert_cooldown = alert_config.remediation.job_retrigger_cooldown_minutes
+        
         should_skip, skip_reason, existing_workflow_id = await remediation_manager.check_deduplication(
-            alert_name, alert_labels
+            alert_name, alert_labels, alert_cooldown_override=alert_cooldown
         )
         if should_skip:
             reason_label = "active_workflow" if existing_workflow_id else "cooldown_or_limit"

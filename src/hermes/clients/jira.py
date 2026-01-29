@@ -184,7 +184,7 @@ class JiraClient:
         self, 
         summary_search_text: str,
         reporter_account_id: str = "712020:b70007c3-9e04-441b-bea0-2c3ef9cdb250",
-        hours_ago: int = 1
+        hours_ago: int = 30
     ) -> Optional[str]:
         """
         Find a JIRA ticket by summary text search.
@@ -202,7 +202,7 @@ class JiraClient:
         # Build JQL query matching the NOC ticket pattern
         jql = (
             f'"Responsible Team" = "SRE-NOC" '
-            f'AND created > -{hours_ago}h '
+            f'AND created > -{hours_ago}d '
             f'AND labels in ("NOC", "ingestion-content") '
             f'AND reporter = {reporter_account_id} '
             f'AND summary ~ "{summary_search_text}" '

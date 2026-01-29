@@ -169,10 +169,16 @@ class RemediationManager:
     async def check_deduplication(
         self, 
         alert_name: str, 
-        alert_labels: Dict[str, str]
+        alert_labels: Dict[str, str],
+        alert_cooldown_override: Optional[int] = None
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Check if this alert should be deduplicated (skipped).
+        
+        Args:
+            alert_name: Name of the alert
+            alert_labels: Alert labels for fingerprinting
+            alert_cooldown_override: Per-alert cooldown override (minutes), uses global if None
         
         Returns:
             Tuple of (should_skip, reason, existing_workflow_id)
@@ -189,7 +195,8 @@ class RemediationManager:
             )
         
         # Check 2: Is this alert in cooldown period?
-        cooldown_config = getattr(self.config.remediation, 'cooldown_minutes', 5)
+        # Use per-alert cooldown if provided, otherwise fall back to global config
+        cooldown_config = alert_cooldown_override if alert_cooldown_override is not None else getattr(self.config.remediation, 'job_retrigger_cooldown_minutes', 5)
         if fingerprint in self._alert_cooldowns:
             cooldown = self._alert_cooldowns[fingerprint]
             elapsed = (datetime.utcnow() - cooldown.last_triggered).total_seconds() / 60
@@ -361,7 +368,7 @@ class RemediationManager:
         self, 
         workflow: RemediationWorkflow,
         resolution_event: asyncio.Event,
-        resolution_wait_minutes: int
+        alertmanager_check_delay_minutes: int
     ) -> bool:
         """
         Wait for alert resolution via polling or early resolution webhook.
@@ -369,13 +376,13 @@ class RemediationManager:
         Args:
             workflow: The remediation workflow
             resolution_event: Event that gets set when a resolved webhook arrives
-            resolution_wait_minutes: Maximum time to wait for resolution
+            alertmanager_check_delay_minutes: Minutes to wait before checking Alertmanager
         
         Returns:
             True if alert resolved, False if timeout reached
         """
         check_interval = self.config.remediation.alert_check_interval_seconds
-        max_wait = resolution_wait_minutes * 60
+        max_wait = alertmanager_check_delay_minutes * 60
         elapsed = 0
         
         while elapsed < max_wait:
@@ -730,9 +737,9 @@ class RemediationManager:
         
         try:
             alert_config = self.config.get_alert_config(workflow.alert_name)
-            resolution_wait = self.config.remediation.resolution_wait_minutes
-            if alert_config and alert_config.remediation.resolution_wait_minutes:
-                resolution_wait = alert_config.remediation.resolution_wait_minutes
+            resolution_wait = self.config.remediation.alertmanager_check_delay_minutes
+            if alert_config and alert_config.remediation.alertmanager_check_delay_minutes:
+                resolution_wait = alert_config.remediation.alertmanager_check_delay_minutes
             
             # Resume based on state
             if workflow.state in [RemediationState.JOB_TRIGGERED, RemediationState.JOB_RUNNING]:

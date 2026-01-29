@@ -10,10 +10,10 @@ rundeck:
 
 remediation:
   poll_interval_seconds: 30
-  resolution_wait_minutes: 5
+  alertmanager_check_delay_minutes: 5
   max_job_wait_minutes: 30
   # P1: Cooldown between remediation attempts for same alert
-  cooldown_minutes: 5
+  job_retrigger_cooldown_minutes: 5
   # P2: Concurrent workflow limits
   max_concurrent_workflows: 100
   # P0: Circuit breaker settings
@@ -42,8 +42,7 @@ alerts:
     job_id: 4d47bff5-c549-48da-9aad-d5ac0619fc94
     remediation:
       enabled: true
-      jira_ticket_option: jira_ticket
-      resolution_wait_minutes: 5
+      alertmanager_check_delay_minutes: 5
     required_fields:
       - node
       - cluster
@@ -60,6 +59,7 @@ alerts:
       fetch_jira_ticket: true
       jira_summary_search_field: dataflow_id
       skip_resolution_check: true  # Alert won't auto-resolve, requires customer action
+      job_retrigger_cooldown_minutes: 30  # Longer cooldown - don't spam Rundeck for customer-dependent alerts
     required_fields:
       - dataflow_id
       - cluster
