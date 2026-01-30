@@ -319,9 +319,9 @@ class RemediationManager:
             
             # Get alert-specific config
             alert_config = self.config.get_alert_config(workflow.alert_name)
-            resolution_wait = self.config.remediation.resolution_wait_minutes
-            if alert_config and alert_config.remediation.resolution_wait_minutes:
-                resolution_wait = alert_config.remediation.resolution_wait_minutes
+            resolution_wait = self.config.remediation.alertmanager_check_delay_minutes
+            if alert_config and alert_config.remediation.alertmanager_check_delay_minutes:
+                resolution_wait = alert_config.remediation.alertmanager_check_delay_minutes
             
             # Check if we should skip resolution check (for alerts requiring customer action)
             skip_resolution_check = alert_config and alert_config.remediation.skip_resolution_check
