@@ -46,8 +46,10 @@ alerts:
     required_fields:
       - node
       - cluster
+      - region
     field_mappings:
       node: node_name
+      region: region
 
   # FN Dataflow Internal Issues - requires customer action, so skip resolution check
   'FN Dataflow Internal Issues':
