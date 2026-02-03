@@ -39,7 +39,7 @@ jira:
 alerts:
   'Node is in NotReady state for 30 minutes':
     fields_location: commonLabels
-    job_id: 4d47bff5-c549-48da-9aad-d5ac0619fc94
+    job_id: 4c3d646b-013e-40cf-82a8-24cae685f182
     remediation:
       enabled: true
       alertmanager_check_delay_minutes: 5
