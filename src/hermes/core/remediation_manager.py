@@ -286,9 +286,7 @@ class RemediationManager:
             state=RemediationState.JOB_TRIGGERED,
             rundeck_execution_id=rundeck_execution_id,
             rundeck_execution_url=rundeck_execution_url,
-            alertmanager_url=alertmanager_url,
-            attempts=1,
-            last_triggered_at=datetime.utcnow()
+            alertmanager_url=alertmanager_url
         )
         
         await self.state_store.save(workflow)
@@ -572,82 +570,18 @@ class RemediationManager:
         # Record success metric with specific outcome
         self._record_outcome(workflow.alert_name, "job_success_no_resolution_check")
     
-    async def _handle_alert_still_firing(self, workflow: RemediationWorkflow):
-        """
-        Called when we checked Alertmanager after job success and the alert is still firing.
-        Implements retry policy: retrigger up to max_attempts (default 2), respecting cooldown.
-        """
-        logger.info(f"Alert still firing for workflow {workflow.id} (attempts={workflow.attempts})")
-
-        # Determine per-alert max attempts (default to 2)
-        alert_cfg = self.config.get_alert_config(workflow.alert_name)
-        max_attempts = getattr(self.config.remediation, 'max_attempts', 2)
-        if alert_cfg and getattr(alert_cfg.remediation, 'max_attempts', None) is not None:
-            max_attempts = alert_cfg.remediation.max_attempts
-
-        # Determine cooldown (minutes) — per-alert override or global
-        cooldown_minutes = getattr(self.config.remediation, 'job_retrigger_cooldown_minutes', 5)
-        if alert_cfg and getattr(alert_cfg.remediation, 'job_retrigger_cooldown_minutes', None) is not None:
-            cooldown_minutes = alert_cfg.remediation.job_retrigger_cooldown_minutes
-
-        # If attempts left, attempt retrigger, else escalate
-        if workflow.attempts < max_attempts:
-            last = workflow.last_triggered_at or workflow.created_at
-            elapsed_min = (datetime.utcnow() - last).total_seconds() / 60.0
-
-            # Respect cooldown: if not enough time elapsed, wait remaining time
-            if elapsed_min < cooldown_minutes:
-                wait_seconds = int((cooldown_minutes - elapsed_min) * 60.0)
-                logger.info(f"Respecting cooldown for workflow {workflow.id}: waiting {wait_seconds}s before retrigger")
-                # note: small sleep here is acceptable because this function is run in a monitoring task.
-                await asyncio.sleep(wait_seconds)
-
-            # Re-trigger Rundeck job using stored options
-            options = getattr(workflow, "rundeck_options", None)
-            if options is None:
-                # If options are not available, we cannot retrigger reliably — escalate
-                logger.error(f"Cannot retrigger workflow {workflow.id} because rundeck_options are missing")
-                await self._escalate(workflow, "missing_rundeck_options_for_retrigger")
-                return
-
-            try:
-                logger.info(f"Retriggering Rundeck job for workflow {workflow.id} (attempt {workflow.attempts + 1}/{max_attempts})")
-                res = await self.rundeck_client.run_job(alert_cfg.job_id, options)
-                new_exec_id = res.get("id")
-                new_exec_url = res.get("permalink") or res.get("permalinkUrl") or res.get("url")
-
-                # Update workflow with new job execution details and increment attempts
-                workflow.rundeck_execution_id = new_exec_id
-                workflow.rundeck_execution_url = new_exec_url
-                workflow.attempts = (workflow.attempts or 0) + 1
-                workflow.last_triggered_at = datetime.utcnow()
-                workflow.update_state(RemediationState.JOB_TRIGGERED)
-                await self.state_store.save(workflow)
-
-                # Reset/replace monitor for this workflow: cancel existing background task if present
-                existing_task = self._running_tasks.get(workflow.id)
-                if existing_task and not existing_task.done():
-                    try:
-                        existing_task.cancel()
-                    except Exception:
-                        pass
-
-                # Start a fresh monitor for this workflow id
-                task = asyncio.create_task(self._monitor_workflow(workflow.id))
-                self._running_tasks[workflow.id] = task
-                logger.info(f"Retriggered remediation for workflow {workflow.id}, now attempts={workflow.attempts}")
-                return
-
-            except Exception as e:
-                logger.exception(f"Failed to retrigger job for workflow {workflow.id}: {e}")
-                await self._escalate(workflow, f"retrigger_failed: {e}")
-                return
-
-        # No attempts left: escalate and mark failed
-        logger.info(f"Max attempts reached for workflow {workflow.id} (attempts={workflow.attempts}/{max_attempts}), escalating")
-        workflow.update_state(RemediationState.ESCALATED, error="max_attempts_reached")
+    async def _handle_alert_still_firing(self, workflow: RemediationWorkflow) -> None:
+        """Handle case where job succeeded but alert is still firing."""
+        workflow.update_state(RemediationState.ALERT_STILL_FIRING)
         await self.state_store.save(workflow)
-        await self._escalate(workflow, "alert still firing after max remediation attempts")
+        
+        reason = "Rundeck job completed successfully but alert is still firing"
+        logger.warning(f"Remediation incomplete for {workflow.alert_name}: {reason}")
+        
+        # Record failure metric
+        self._record_outcome(workflow.alert_name, "alert_still_firing")
+        
+        await self._escalate(workflow, reason)
     
     async def _handle_job_failure(self, workflow: RemediationWorkflow) -> None:
         """Handle Rundeck job failure."""
