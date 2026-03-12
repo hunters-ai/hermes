@@ -39,6 +39,8 @@ class RemediationWorkflow:
     updated_at: datetime = field(default_factory=datetime.utcnow)
     job_completed_at: Optional[datetime] = None
     error_message: Optional[str] = None
+    attempts: int = 0
+    last_triggered_at: Optional[datetime] = None
     
     def update_state(self, new_state: RemediationState, error: Optional[str] = None):
         """Update workflow state."""
@@ -224,6 +226,10 @@ class DynamoDBStateStore(StateStore):
         if workflow.alertmanager_url:
             item["alertmanager_url"] = workflow.alertmanager_url
         
+        item["attempts"] = workflow.attempts
+        if workflow.last_triggered_at:
+            item["last_triggered_at"] = workflow.last_triggered_at.isoformat()
+        
         return item
     
     def _item_to_workflow(self, item: Dict) -> RemediationWorkflow:
@@ -240,7 +246,9 @@ class DynamoDBStateStore(StateStore):
             updated_at=datetime.fromisoformat(item["updated_at"]),
             job_completed_at=datetime.fromisoformat(item["job_completed_at"]) if item.get("job_completed_at") else None,
             error_message=item.get("error_message"),
-            alertmanager_url=item.get("alertmanager_url")
+            alertmanager_url=item.get("alertmanager_url"),
+            attempts=int(item.get("attempts", 0)),
+            last_triggered_at=datetime.fromisoformat(item["last_triggered_at"]) if item.get("last_triggered_at") else None
         )
     
     async def save(self, workflow: RemediationWorkflow) -> None:
