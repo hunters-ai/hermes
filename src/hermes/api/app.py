@@ -363,7 +363,7 @@ class AlertProcessor:
             response_data = await self.rundeck.run_job(alert_config.job_id, payload)
 
             # Parse execution details
-            exec_id = response_data.get("id")
+            exec_id = str(response_data.get("id")) if response_data.get("id") is not None else None
             exec_url = response_data.get("permalink") or response_data.get("permalinkUrl") or response_data.get("url")
 
             RUNDECK_JOB_TRIGGERS.labels(alert_type=alert_name, status="triggered").inc()
