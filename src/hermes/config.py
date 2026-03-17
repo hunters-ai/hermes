@@ -24,6 +24,8 @@ class AlertRemediationConfig(BaseModel):
     # Alert payload forwarding - send full alert context to Rundeck job
     send_alert_payload: bool = Field(default=False, description="Send full alert payload as JSON string to Rundeck job")
     alert_payload_option_name: str = Field(default="alert_payload", description="Rundeck option name for alert payload JSON")
+    # Static options - always sent to Rundeck job regardless of alert payload
+    static_options: Dict[str, str] = Field(default_factory=dict, description="Static key-value pairs always passed to Rundeck job options")
 
 
 class AlertConfig(BaseModel):
