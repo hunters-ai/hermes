@@ -306,12 +306,12 @@ class AlertProcessor:
                 value = alerts_labels[field]
                 logger.info(f"Field '{field}' found in alerts[0].labels (fallback)")
 
-            # fallback to per-alert static_fields from config
+            # fallback to per-alert static_options from config
             else:
-                static_fields = getattr(alert_config.remediation, "static_fields", None)
-                if static_fields and field in static_fields:
-                    value = static_fields[field]
-                    logger.info(f"Using static field '{field}' -> '{value}' for alert '{alert_name}'")
+                static_options = alert_config.remediation.static_options
+                if static_options and field in static_options:
+                    value = static_options[field]
+                    logger.info(f"Using static option '{field}' -> '{value}' for alert '{alert_name}'")
 
             if value is not None:
                 target_field = alert_config.field_mappings.get(field, field)
@@ -350,20 +350,10 @@ class AlertProcessor:
             payload[payload_option_name] = json.dumps(full_alert_context, default=str)
             logger.info(f"Added full alert payload to Rundeck options as '{payload_option_name}'")
 
-        static_opts = getattr(alert_config.remediation, "static_options", None) or getattr(alert_config, "static_options", None)
+        static_opts = alert_config.remediation.static_options
         if static_opts:
-            # Ensure it's a dict-like object
-            if isinstance(static_opts, dict):
-                # Only add keys that are missing in payload so label-derived values take precedence
-                new_keys = []
-                for k, v in static_opts.items():
-                    if k not in payload:
-                        payload[k] = v
-                        new_keys.append(k)
-                if new_keys:
-                    logger.info(f"Applied static Rundeck options for alert '{alert_name}': added keys {new_keys}")
-            else:
-                logger.warning(f"static_options for alert '{alert_name}' is not a dict, ignoring: {type(static_opts)}")
+            payload.update(static_opts)
+            logger.info(f"Final Rundeck payload (after static_options merge): {json.dumps(payload, indent=2)}")
 
         logger.info(f"Sending to Rundeck job {alert_config.job_id} with options: {json.dumps(payload, indent=2)}")
         
