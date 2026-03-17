@@ -255,10 +255,11 @@ class AlertPayload(BaseModel):
 class AlertProcessor:
     """Processes incoming alerts and triggers Rundeck jobs."""
     
-    def __init__(self, config: Config, rundeck: RundeckClient, jira: Optional[JiraClient] = None):
+    def __init__(self, config: Config, rundeck: RundeckClient, jira: Optional[JiraClient] = None, remediation_manager: Optional[RemediationManager] = None):
         self.config = config
         self.rundeck = rundeck
         self.jira = jira
+        self.remediation_manager = remediation_manager
 
     def process_alert(self, payload: Dict[str, Any]) -> tuple:
         alert_name = payload.get("commonLabels", {}).get("alertname")
@@ -358,12 +359,12 @@ class AlertProcessor:
             logger.info(f"Triggered Rundeck job {alert_config.job_id} -> execution {exec_id}")
 
             # If we have a remediation manager available, start the workflow and pass options
-            if remediation_manager:
+            if self.remediation_manager:
                 # Extract alert labels for matching; reuse your existing logic to derive labels
                 alert_labels_for_match = full_alert_context.get("alert_labels", {}) if full_alert_context else payload.get("alert_labels", {})
 
                 # Start the remediation workflow with rundeck options
-                workflow_id = await remediation_manager.start_remediation(
+                workflow_id = await self.remediation_manager.start_remediation(
                     alert_name=alert_name,
                     alert_labels=alert_labels_for_match,
                     rundeck_execution_id=exec_id,
@@ -439,7 +440,7 @@ class AlertProcessor:
         raise ValueError(message)
 
 
-processor = AlertProcessor(app_config, rundeck_client, jira_client) if app_config and rundeck_client else None
+processor = AlertProcessor(app_config, rundeck_client, jira_client, remediation_manager) if app_config and rundeck_client else None
 
 
 @app.middleware("http")
