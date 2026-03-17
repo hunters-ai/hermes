@@ -368,7 +368,8 @@ class AlertProcessor:
                     alert_labels=alert_labels_for_match,
                     rundeck_execution_id=exec_id,
                     rundeck_execution_url=exec_url,
-                    alertmanager_url=extract_alertmanager_url(full_alert_context.get("source_alertmanager") if full_alert_context else None)
+                    alertmanager_url=extract_alertmanager_url(full_alert_context.get("source_alertmanager") if full_alert_context else None),
+                    rundeck_options=payload
                 )
                 logger.info(f"Started remediation workflow {workflow_id} for alert {alert_name}")
 
@@ -683,7 +684,8 @@ async def receive_alert(request: Request):
                 alert_labels=alert_labels,
                 rundeck_execution_id=execution_info["execution_id"],
                 rundeck_execution_url=execution_info["execution_url"],
-                alertmanager_url=alertmanager_url
+                alertmanager_url=alertmanager_url,
+                rundeck_options=processed_alert
             )
             REMEDIATION_WORKFLOWS.labels(alert_type=alert_name).inc()
             logger.info(f"Started remediation workflow: {workflow_id} (AM: {alertmanager_url})")
