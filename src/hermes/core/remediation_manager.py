@@ -261,7 +261,8 @@ class RemediationManager:
         alert_labels: Dict[str, str],
         rundeck_execution_id: str,
         rundeck_execution_url: Optional[str] = None,
-        alertmanager_url: Optional[str] = None
+        alertmanager_url: Optional[str] = None,
+        rundeck_options: Optional[Dict[str, str]] = None
     ) -> str:
         """
         Start tracking a remediation workflow.
@@ -274,6 +275,7 @@ class RemediationManager:
             rundeck_execution_id: Rundeck execution ID
             rundeck_execution_url: URL to the Rundeck execution
             alertmanager_url: Base URL of the source Alertmanager (for global service mode)
+            rundeck_options: Rundeck job options used for the trigger (stored for retries)
         
         Returns the workflow ID.
         """
@@ -286,7 +288,10 @@ class RemediationManager:
             state=RemediationState.JOB_TRIGGERED,
             rundeck_execution_id=rundeck_execution_id,
             rundeck_execution_url=rundeck_execution_url,
-            alertmanager_url=alertmanager_url
+            alertmanager_url=alertmanager_url,
+            attempts=1,
+            last_triggered_at=datetime.utcnow(),
+            rundeck_options=rundeck_options
         )
         
         await self.state_store.save(workflow)
@@ -312,45 +317,53 @@ class RemediationManager:
         self._resolution_events[workflow_id] = resolution_event
         
         try:
-            workflow = await self.state_store.get(workflow_id)
-            if not workflow:
-                logger.error(f"Workflow {workflow_id} not found")
-                return
-            
-            # Get alert-specific config
-            alert_config = self.config.get_alert_config(workflow.alert_name)
-            resolution_wait = self.config.remediation.alertmanager_check_delay_minutes
-            if alert_config and alert_config.remediation.alertmanager_check_delay_minutes:
-                resolution_wait = alert_config.remediation.alertmanager_check_delay_minutes
-            
-            # Check if we should skip resolution check (for alerts requiring customer action)
-            skip_resolution_check = alert_config and alert_config.remediation.skip_resolution_check
-            
-            # Step 1: Wait for job completion
-            job_success = await self._wait_for_job_completion(workflow)
-            
-            if not job_success:
-                # Job failed - escalate immediately
-                await self._handle_job_failure(workflow)
-                return
-            
-            # Step 2: If skip_resolution_check is set, mark as success without waiting for alert resolution
-            if skip_resolution_check:
-                logger.info(f"Job succeeded, skipping resolution check for {workflow.alert_name} (customer action required)")
-                await self._handle_success_no_resolution_check(workflow)
-                return
-            
-            # Step 3: Wait for alert resolution (with polling and early resolution support)
-            logger.info(f"Job succeeded, waiting up to {resolution_wait} minutes for alert resolution")
-            workflow.update_state(RemediationState.WAITING_RESOLUTION)
-            await self.state_store.save(workflow)
-            
-            alert_resolved = await self._wait_for_alert_resolution(workflow, resolution_event, resolution_wait)
-            
-            if alert_resolved:
-                await self._handle_success(workflow)
-            else:
-                await self._handle_alert_still_firing(workflow)
+            while True:
+                workflow = await self.state_store.get(workflow_id)
+                if not workflow:
+                    logger.error(f"Workflow {workflow_id} not found")
+                    return
+                
+                # Get alert-specific config
+                alert_config = self.config.get_alert_config(workflow.alert_name)
+                resolution_wait = self.config.remediation.alertmanager_check_delay_minutes
+                if alert_config and alert_config.remediation.alertmanager_check_delay_minutes:
+                    resolution_wait = alert_config.remediation.alertmanager_check_delay_minutes
+                
+                # Check if we should skip resolution check (for alerts requiring customer action)
+                skip_resolution_check = alert_config and alert_config.remediation.skip_resolution_check
+                
+                # Step 1: Wait for job completion
+                if workflow.state in [RemediationState.JOB_TRIGGERED, RemediationState.JOB_RUNNING]:
+                    job_success = await self._wait_for_job_completion(workflow)
+                    
+                    if not job_success:
+                        # Job failed - escalate immediately
+                        await self._handle_job_failure(workflow)
+                        return
+                
+                # Step 2: If skip_resolution_check is set, mark as success without waiting for alert resolution
+                if skip_resolution_check:
+                    logger.info(f"Job succeeded, skipping resolution check for {workflow.alert_name} (customer action required)")
+                    await self._handle_success_no_resolution_check(workflow)
+                    return
+                
+                # Step 3: Wait for alert resolution (with polling and early resolution support)
+                logger.info(f"Job succeeded, waiting up to {resolution_wait} minutes for alert resolution")
+                workflow.update_state(RemediationState.WAITING_RESOLUTION)
+                await self.state_store.save(workflow)
+                
+                alert_resolved = await self._wait_for_alert_resolution(workflow, resolution_event, resolution_wait)
+                
+                if alert_resolved:
+                    await self._handle_success(workflow)
+                    return
+                else:
+                    retry_initiated = await self._handle_alert_still_firing(workflow)
+                    if not retry_initiated:
+                        return
+                    # Retry was initiated, loop around and monitor the new job
+                    # Clear resolution event for the new job
+                    resolution_event.clear()
                 
         except asyncio.CancelledError:
             logger.info(f"Workflow {workflow_id} monitoring cancelled")
@@ -570,18 +583,72 @@ class RemediationManager:
         # Record success metric with specific outcome
         self._record_outcome(workflow.alert_name, "job_success_no_resolution_check")
     
-    async def _handle_alert_still_firing(self, workflow: RemediationWorkflow) -> None:
-        """Handle case where job succeeded but alert is still firing."""
-        workflow.update_state(RemediationState.ALERT_STILL_FIRING)
+    async def _handle_alert_still_firing(self, workflow: RemediationWorkflow) -> bool:
+        """
+        Called when we checked Alertmanager after job success and the alert is still firing.
+        Implements retry policy: retrigger up to max_attempts, respecting cooldown.
+        Returns True if a retry was initiated, False if max attempts reached or error occurred.
+        """
+        logger.info(f"Alert still firing for workflow {workflow.id} (attempts={workflow.attempts})")
+
+        # Determine per-alert max attempts
+        alert_cfg = self.config.get_alert_config(workflow.alert_name)
+        max_attempts = getattr(self.config.remediation, 'max_attempts', 2)
+        if alert_cfg and getattr(alert_cfg.remediation, 'max_attempts', None) is not None:
+            max_attempts = alert_cfg.remediation.max_attempts
+
+        # Determine cooldown (minutes) — per-alert override or global
+        cooldown_minutes = getattr(self.config.remediation, 'job_retrigger_cooldown_minutes', 5)
+        if alert_cfg and getattr(alert_cfg.remediation, 'job_retrigger_cooldown_minutes', None) is not None:
+            cooldown_minutes = alert_cfg.remediation.job_retrigger_cooldown_minutes
+
+        # If attempts left, attempt retrigger, else escalate
+        if workflow.attempts < max_attempts:
+            last = workflow.last_triggered_at or workflow.created_at
+            elapsed_min = (datetime.utcnow() - last).total_seconds() / 60.0
+
+            # Respect cooldown: if not enough time elapsed, wait remaining time
+            if elapsed_min < cooldown_minutes:
+                wait_seconds = int((cooldown_minutes - elapsed_min) * 60.0)
+                logger.info(f"Respecting cooldown for workflow {workflow.id}: waiting {wait_seconds}s before retrigger")
+                await asyncio.sleep(wait_seconds)
+
+            # Re-trigger Rundeck job using stored options
+            options = workflow.rundeck_options
+            if options is None:
+                # If options are not available, we cannot retrigger reliably — escalate
+                logger.error(f"Cannot retrigger workflow {workflow.id} because rundeck_options are missing")
+                await self._escalate(workflow, "missing_rundeck_options_for_retrigger")
+                return False
+
+            try:
+                logger.info(f"Retriggering Rundeck job for workflow {workflow.id} (attempt {workflow.attempts + 1}/{max_attempts})")
+                res = await self.rundeck_client.run_job(alert_cfg.job_id, options)
+                new_exec_id = res.get("id")
+                new_exec_url = res.get("permalink") or res.get("permalinkUrl") or res.get("url")
+
+                # Update workflow with new job execution details and increment attempts
+                workflow.rundeck_execution_id = new_exec_id
+                workflow.rundeck_execution_url = new_exec_url
+                workflow.attempts = (workflow.attempts or 0) + 1
+                workflow.last_triggered_at = datetime.utcnow()
+                workflow.update_state(RemediationState.JOB_TRIGGERED)
+                await self.state_store.save(workflow)
+
+                logger.info(f"Retriggered remediation for workflow {workflow.id}, now attempts={workflow.attempts}")
+                return True
+
+            except Exception as e:
+                logger.exception(f"Failed to retrigger job for workflow {workflow.id}: {e}")
+                await self._escalate(workflow, f"retrigger_failed: {e}")
+                return False
+
+        # No attempts left: escalate and mark failed
+        logger.info(f"Max attempts reached for workflow {workflow.id} (attempts={workflow.attempts}/{max_attempts}), escalating")
+        workflow.update_state(RemediationState.ESCALATED, error="max_attempts_reached")
         await self.state_store.save(workflow)
-        
-        reason = "Rundeck job completed successfully but alert is still firing"
-        logger.warning(f"Remediation incomplete for {workflow.alert_name}: {reason}")
-        
-        # Record failure metric
-        self._record_outcome(workflow.alert_name, "alert_still_firing")
-        
-        await self._escalate(workflow, reason)
+        await self._escalate(workflow, "alert still firing after max remediation attempts")
+        return False
     
     async def _handle_job_failure(self, workflow: RemediationWorkflow) -> None:
         """Handle Rundeck job failure."""
@@ -734,50 +801,12 @@ class RemediationManager:
         if not resolution_event:
             resolution_event = asyncio.Event()
             self._resolution_events[workflow.id] = resolution_event
-        
-        try:
-            alert_config = self.config.get_alert_config(workflow.alert_name)
-            resolution_wait = self.config.remediation.alertmanager_check_delay_minutes
-            if alert_config and alert_config.remediation.alertmanager_check_delay_minutes:
-                resolution_wait = alert_config.remediation.alertmanager_check_delay_minutes
             
-            # Resume based on state
-            if workflow.state in [RemediationState.JOB_TRIGGERED, RemediationState.JOB_RUNNING]:
-                # Re-check job completion
-                job_success = await self._wait_for_job_completion(workflow)
-                if not job_success:
-                    await self._handle_job_failure(workflow)
-                    return
-                
-                # Job succeeded, wait for resolution
-                workflow.update_state(RemediationState.WAITING_RESOLUTION)
-                await self.state_store.save(workflow)
-                
-                alert_resolved = await self._wait_for_alert_resolution(workflow, resolution_event, resolution_wait)
-                if alert_resolved:
-                    await self._handle_success(workflow)
-                else:
-                    await self._handle_alert_still_firing(workflow)
-                    
-            elif workflow.state == RemediationState.JOB_SUCCEEDED:
-                # Job already succeeded, just wait for resolution
-                workflow.update_state(RemediationState.WAITING_RESOLUTION)
-                await self.state_store.save(workflow)
-                
-                alert_resolved = await self._wait_for_alert_resolution(workflow, resolution_event, resolution_wait)
-                if alert_resolved:
-                    await self._handle_success(workflow)
-                else:
-                    await self._handle_alert_still_firing(workflow)
-                    
-            elif workflow.state == RemediationState.WAITING_RESOLUTION:
-                # Already waiting, continue polling
-                alert_resolved = await self._wait_for_alert_resolution(workflow, resolution_event, resolution_wait)
-                if alert_resolved:
-                    await self._handle_success(workflow)
-                else:
-                    await self._handle_alert_still_firing(workflow)
-                    
+        try:
+            # Resume monitor as loop by directly turning this into a while True loop or calling the _monitor_workflow method
+            # Actually, _monitor_workflow method is already a while True loop!
+            # We can just jump directly into the _monitor_workflow method
+            await self._monitor_workflow(workflow.id)
         except asyncio.CancelledError:
             logger.info(f"Recovered workflow {workflow.id} monitoring cancelled")
         except Exception as e:

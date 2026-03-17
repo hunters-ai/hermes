@@ -14,6 +14,7 @@ class AlertRemediationConfig(BaseModel):
     enabled: bool = Field(default=True)
     alertmanager_check_delay_minutes: Optional[int] = Field(default=None, description="Minutes to wait after job success before checking Alertmanager for resolution")
     job_retrigger_cooldown_minutes: Optional[int] = Field(default=None, description="Override global cooldown (min time before retriggering same Rundeck job)")
+    max_attempts: Optional[int] = Field(default=None, description="Override global max retry attempts for this alert")
     jira_ticket_option: str = Field(default="jira_ticket", description="Rundeck option name for JIRA ticket")
     # JIRA ticket fetching - for alerts where ticket is created by jira-alert service
     fetch_jira_ticket: bool = Field(default=False, description="Fetch JIRA ticket ID via JQL before triggering Rundeck")
@@ -43,6 +44,7 @@ class RemediationConfig(BaseModel):
     max_job_wait_minutes: int = Field(default=30, description="Timeout for job completion")
     alert_check_interval_seconds: int = Field(default=30, description="How often to poll Alertmanager during resolution wait")
     job_retrigger_cooldown_minutes: int = Field(default=5, description="Minimum minutes before retriggering same Rundeck job for same alert")
+    max_attempts: int = Field(default=2, description="Default max retry attempts for remediation (initial + retries)")
     max_concurrent_workflows: int = Field(default=100, description="Maximum number of concurrent remediation workflows")
     circuit_breaker_failure_threshold: int = Field(default=5, description="Number of failures before opening circuit breaker")
     circuit_breaker_recovery_seconds: int = Field(default=60, description="Time to wait before retrying after circuit breaker opens")

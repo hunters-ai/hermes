@@ -100,7 +100,7 @@ async def test_send_alert_payload_when_enabled(mock_config_with_payload_forwardi
     call_args = mock_rundeck.run_job.call_args
     
     # Check job options contain the alert payload as JSON string
-    job_options = call_args.kwargs["options"]
+    job_options = call_args.args[1]
     assert "alert_payload" in job_options
     
     # Verify it's a JSON string
@@ -163,7 +163,7 @@ async def test_no_alert_payload_when_disabled(mock_config_without_payload_forwar
     call_args = mock_rundeck.run_job.call_args
     
     # Check job options do NOT contain the alert payload
-    job_options = call_args.kwargs["options"]
+    job_options = call_args.args[1]
     assert "alert_payload" not in job_options
     
     # Only required fields should be present
@@ -210,7 +210,7 @@ async def test_custom_payload_option_name(mock_config_with_payload_forwarding):
     
     # Verify custom option name is used
     call_args = mock_rundeck.run_job.call_args
-    job_options = call_args.kwargs["options"]
+    job_options = call_args.args[1]
     
     assert "custom_alert_data" in job_options
     assert "alert_payload" not in job_options

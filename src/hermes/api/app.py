@@ -255,10 +255,11 @@ class AlertPayload(BaseModel):
 class AlertProcessor:
     """Processes incoming alerts and triggers Rundeck jobs."""
     
-    def __init__(self, config: Config, rundeck: RundeckClient, jira: Optional[JiraClient] = None):
+    def __init__(self, config: Config, rundeck: RundeckClient, jira: Optional[JiraClient] = None, remediation_manager: Optional[RemediationManager] = None):
         self.config = config
         self.rundeck = rundeck
         self.jira = jira
+        self.remediation_manager = remediation_manager
 
     def process_alert(self, payload: Dict[str, Any]) -> tuple:
         alert_name = payload.get("commonLabels", {}).get("alertname")
@@ -358,23 +359,42 @@ class AlertProcessor:
         logger.info(f"Sending to Rundeck job {alert_config.job_id} with options: {json.dumps(payload, indent=2)}")
         
         try:
-            response_data = await self.rundeck.run_job(
-                job_id=alert_config.job_id,
-                options=payload
-            )
-        except Exception as e:
-            WEBHOOK_ERRORS.inc()
-            RUNDECK_JOB_TRIGGERS.labels(alert_type=alert_name, status="error").inc()
-            logger.error(f"Error sending to Rundeck: {e}")
-            raise Exception(f"Rundeck job trigger failed: {e}")
+            # response_data contains the execution id and possibly permalink/url
+            response_data = await self.rundeck.run_job(alert_config.job_id, payload)
 
-        WEBHOOK_REQUESTS.inc()
-        RUNDECK_JOB_TRIGGERS.labels(alert_type=alert_name, status="success").inc()
-        
-        return {
-            "execution_id": str(response_data.get("id", "")),
-            "execution_url": response_data.get("permalink") or response_data.get("href", "")
-        }
+            # Parse execution details
+            exec_id = response_data.get("id")
+            exec_url = response_data.get("permalink") or response_data.get("permalinkUrl") or response_data.get("url")
+
+            RUNDECK_JOB_TRIGGERS.labels(alert_type=alert_name, status="triggered").inc()
+            logger.info(f"Triggered Rundeck job {alert_config.job_id} -> execution {exec_id}")
+
+            # If we have a remediation manager available, start the workflow and pass options
+            if self.remediation_manager:
+                # Extract alert labels for matching; reuse your existing logic to derive labels
+                alert_labels_for_match = full_alert_context.get("alert_labels", {}) if full_alert_context else payload.get("alert_labels", {})
+
+                # Start the remediation workflow with rundeck options
+                workflow_id = await self.remediation_manager.start_remediation(
+                    alert_name=alert_name,
+                    alert_labels=alert_labels_for_match,
+                    rundeck_execution_id=exec_id,
+                    rundeck_execution_url=exec_url,
+                    alertmanager_url=extract_alertmanager_url(full_alert_context.get("source_alertmanager") if full_alert_context else None),
+                    rundeck_options=payload
+                )
+                logger.info(f"Started remediation workflow {workflow_id} for alert {alert_name}")
+
+            return {
+                "status": "triggered",
+                "execution_id": exec_id,
+                "execution_url": exec_url
+            }
+
+        except Exception as e:
+            RUNDECK_JOB_TRIGGERS.labels(alert_type=alert_name, status="error").inc()
+            logger.exception(f"Failed to trigger Rundeck job for alert {alert_name}: {e}")
+            self._raise_error(f"failed to trigger rundeck job: {e}")
 
     async def _fetch_jira_ticket(
         self, 
@@ -431,7 +451,7 @@ class AlertProcessor:
         raise ValueError(message)
 
 
-processor = AlertProcessor(app_config, rundeck_client, jira_client) if app_config and rundeck_client else None
+processor = AlertProcessor(app_config, rundeck_client, jira_client, remediation_manager) if app_config and rundeck_client else None
 
 
 @app.middleware("http")
@@ -676,7 +696,8 @@ async def receive_alert(request: Request):
                 alert_labels=alert_labels,
                 rundeck_execution_id=execution_info["execution_id"],
                 rundeck_execution_url=execution_info["execution_url"],
-                alertmanager_url=alertmanager_url
+                alertmanager_url=alertmanager_url,
+                rundeck_options=processed_alert
             )
             REMEDIATION_WORKFLOWS.labels(alert_type=alert_name).inc()
             logger.info(f"Started remediation workflow: {workflow_id} (AM: {alertmanager_url})")
