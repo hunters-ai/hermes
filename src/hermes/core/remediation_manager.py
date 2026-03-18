@@ -624,7 +624,7 @@ class RemediationManager:
             try:
                 logger.info(f"Retriggering Rundeck job for workflow {workflow.id} (attempt {workflow.attempts + 1}/{max_attempts})")
                 res = await self.rundeck_client.run_job(alert_cfg.job_id, options)
-                new_exec_id = res.get("id")
+                new_exec_id = str(res.get("id", ""))
                 new_exec_url = res.get("permalink") or res.get("permalinkUrl") or res.get("url")
 
                 # Update workflow with new job execution details and increment attempts
