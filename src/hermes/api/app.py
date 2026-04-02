@@ -326,7 +326,63 @@ class AlertProcessor:
             PROCESSING_ERRORS.labels(error_type="missing_fields", alert_type=alert_name).inc()
             logger.warning(f"Missing required fields {missing_fields} for alert '{alert_name}'")
         
+        # Apply value mappings - conditionally set Rundeck options based on field values
+        if alert_config.value_mappings:
+            self._apply_value_mappings(alert_name, result, source_map, alerts_labels, alert_config)
+        
         return result, alert_name, missing_fields
+
+    def _apply_value_mappings(
+        self, 
+        alert_name: str, 
+        result: Dict[str, Any], 
+        source_map: Dict[str, Any], 
+        alerts_labels: Dict[str, Any], 
+        alert_config
+    ) -> None:
+        """
+        Apply conditional value mappings to set Rundeck options based on alert label values.
+        
+        Example configuration:
+            value_mappings:
+              region:
+                us-west-2:
+                  cluster: us-west-2-prod-new
+                eu-west-1:
+                  cluster_name: eu-west-1-prod
+        
+        This will check the value of the 'region' field and conditionally set options.
+        """
+        for source_field, value_map in alert_config.value_mappings.items():
+            # Get the actual value from the alert - check multiple sources
+            field_value = None
+            
+            # First check in source_map (commonLabels or configured location)
+            if source_field in source_map:
+                field_value = source_map[source_field]
+            # Then check in alerts[0].labels
+            elif source_field in alerts_labels:
+                field_value = alerts_labels[source_field]
+            # Finally check in already-processed result (might be under a mapped name)
+            elif source_field in result:
+                field_value = result[source_field]
+            
+            if field_value is None:
+                logger.debug(f"Source field '{source_field}' not found for value mapping in alert '{alert_name}'")
+                continue
+            
+            # Check if this value has any mappings configured
+            if field_value not in value_map:
+                logger.debug(f"No value mapping configured for {source_field}={field_value} in alert '{alert_name}'")
+                continue
+            
+            # Apply the mappings for this value
+            mappings_to_apply = value_map[field_value]
+            logger.info(f"Applying value mappings for {source_field}={field_value}: {mappings_to_apply}")
+            
+            for option_name, option_value in mappings_to_apply.items():
+                result[option_name] = option_value
+                logger.info(f"Set Rundeck option '{option_name}' = '{option_value}' based on {source_field}={field_value}")
 
     async def send_to_webhook(self, alert_name: str, payload: Dict[str, Any], alert_time: str, full_alert_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Send to Rundeck and return execution details."""

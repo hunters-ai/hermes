@@ -50,6 +50,15 @@ alerts:
     field_mappings:
       node: node_name
       region: region
+    # Example: Conditionally set cluster option based on region value
+    value_mappings:
+      region:
+        us-west-2:
+          cluster_name: us-west-2-prod-new
+        eu-west-1:
+          cluster_name: eu-west-1-prod
+        ap-south-1:
+          cluster_name: ap-south-1-prod
 
   # FN Dataflow Internal Issues - requires customer action, so skip resolution check
   'FN Dataflow Internal Issues':

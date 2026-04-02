@@ -35,6 +35,14 @@ class AlertConfig(BaseModel):
     fields_location: str = Field(default="commonLabels", alias="fields_location")
     remediation: AlertRemediationConfig = Field(default_factory=AlertRemediationConfig)
     field_mappings: Dict[str, str] = Field(default_factory=dict, alias="field_mappings")
+    # Value mappings - conditionally set Rundeck options based on alert label values
+    # Structure: {source_field: {field_value: {rundeck_option: option_value}}}
+    # Example: {"region": {"us-west-2": {"cluster": "us-west-2-prod-new"}}}
+    value_mappings: Dict[str, Dict[str, Dict[str, str]]] = Field(
+        default_factory=dict, 
+        alias="value_mappings",
+        description="Conditional mappings based on alert label values"
+    )
 
 
 class RemediationConfig(BaseModel):
