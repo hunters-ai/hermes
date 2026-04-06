@@ -384,6 +384,60 @@ class AlertProcessor:
                 result[option_name] = option_value
                 logger.info(f"Set Rundeck option '{option_name}' = '{option_value}' based on {source_field}={field_value}")
 
+    def _resolve_job_id(
+        self,
+        alert_name: str,
+        alert_config,
+        payload: Dict[str, Any],
+        source_map: Dict[str, Any],
+        alerts_labels: Dict[str, Any]
+    ) -> str:
+        """
+        Resolve the Rundeck job ID based on job_id_mappings configuration.
+        
+        Checks alert field values and conditionally routes to different jobs.
+        Falls back to the default job_id if no mapping matches.
+        
+        Example configuration:
+            job_id: "default-job-uuid"
+            job_id_mappings:
+              error_message:
+                "Data-collection-vendor-is-down": "job-uuid-1"
+                "Active-dataflow-failed": "job-uuid-2"
+        """
+        if not alert_config.job_id_mappings:
+            return alert_config.job_id
+        
+        for source_field, value_to_job_map in alert_config.job_id_mappings.items():
+            # Get the actual value from the alert - check multiple sources
+            field_value = None
+            
+            # First check in source_map (commonLabels or configured location)
+            if source_field in source_map:
+                field_value = source_map[source_field]
+            # Then check in alerts[0].labels
+            elif source_field in alerts_labels:
+                field_value = alerts_labels[source_field]
+            # Finally check in already-processed payload (might be under a mapped name)
+            elif source_field in payload:
+                field_value = payload[source_field]
+            
+            if field_value is None:
+                logger.debug(f"Source field '{source_field}' not found for job_id mapping in alert '{alert_name}'")
+                continue
+            
+            # Check if this value has a job mapping configured
+            if field_value in value_to_job_map:
+                resolved_job_id = value_to_job_map[field_value]
+                logger.info(f"Resolved job_id for alert '{alert_name}': {source_field}={field_value} -> {resolved_job_id}")
+                return resolved_job_id
+            else:
+                logger.debug(f"No job_id mapping configured for {source_field}={field_value} in alert '{alert_name}'")
+        
+        # No mapping matched, use default job_id
+        logger.debug(f"Using default job_id for alert '{alert_name}': {alert_config.job_id}")
+        return alert_config.job_id
+
     async def send_to_webhook(self, alert_name: str, payload: Dict[str, Any], alert_time: str, full_alert_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Send to Rundeck and return execution details."""
         alert_config = self.config.get_alert_config(alert_name)
@@ -412,18 +466,23 @@ class AlertProcessor:
             payload.update(static_opts)
             logger.info(f"Final Rundeck payload (after static_options merge): {json.dumps(payload, indent=2)}")
 
-        logger.info(f"Sending to Rundeck job {alert_config.job_id} with options: {json.dumps(payload, indent=2)}")
+        # Resolve the actual job_id to use (might be conditional based on field values)
+        source_map = full_alert_context.get("source_map", {}) if full_alert_context else {}
+        alerts_labels = full_alert_context.get("alerts_labels", {}) if full_alert_context else {}
+        resolved_job_id = self._resolve_job_id(alert_name, alert_config, payload, source_map, alerts_labels)
+
+        logger.info(f"Sending to Rundeck job {resolved_job_id} with options: {json.dumps(payload, indent=2)}")
         
         try:
             # response_data contains the execution id and possibly permalink/url
-            response_data = await self.rundeck.run_job(alert_config.job_id, payload)
+            response_data = await self.rundeck.run_job(resolved_job_id, payload)
 
             # Parse execution details
             exec_id = str(response_data.get("id")) if response_data.get("id") is not None else None
             exec_url = response_data.get("permalink") or response_data.get("permalinkUrl") or response_data.get("url")
 
             RUNDECK_JOB_TRIGGERS.labels(alert_type=alert_name, status="triggered").inc()
-            logger.info(f"Triggered Rundeck job {alert_config.job_id} -> execution {exec_id}")
+            logger.info(f"Triggered Rundeck job {resolved_job_id} -> execution {exec_id}")
 
             # If we have a remediation manager available, start the workflow and pass options
             if self.remediation_manager:
