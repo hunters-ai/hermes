@@ -61,9 +61,15 @@ alerts:
           cluster_name: ap-south-1-prod
 
   # FN Dataflow Internal Issues - requires customer action, so skip resolution check
+  # Routes to different Rundeck jobs based on error_message field value
   'FN Dataflow Internal Issues':
     fields_location: commonLabels
-    job_id: 6f037e9c-8342-49d3-b035-105b6e9abf77
+    job_id: 6f037e9c-8342-49d3-b035-105b6e9abf77  # Default fallback job
+    job_id_mappings:
+      error_message:
+        "Data-collection-vendor-is-down": "07262d42-6883-40be-8af2-69a19ed0744d"
+        "Data-collection-got-rate-limit-error": "07262d42-6883-40be-8af2-69a19ed0744d"
+        "Active-dataflow-is-not-running-or-failed": "c215a485-b533-4441-a722-1073be2a7cb8"
     remediation:
       enabled: true
       jira_ticket_option: jira_ticket
@@ -74,6 +80,7 @@ alerts:
     required_fields:
       - dataflow_id
       - cluster
+      - error_message  # Added to ensure error_message is extracted from alert
     field_mappings:
       cluster: cluster_name
 

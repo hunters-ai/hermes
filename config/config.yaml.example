@@ -32,6 +32,24 @@ alerts:
       resolution_wait_minutes: 5
       jira_ticket_option: "jira_ticket"
 
+  # Example: Conditional job routing based on field values
+  # Routes to different jobs based on error_message field
+  "FN Dataflow Internal Issues":
+    job_id: "default-job-uuid"  # Fallback if no mapping matches
+    fields_location: "commonLabels"
+    job_id_mappings:
+      error_message:
+        "Data-collection-vendor-is-down": "07262d42-6883-40be-8af2-69a19ed0744d"
+        "Data-collection-got-rate-limit-error": "07262d42-6883-40be-8af2-69a19ed0744d"
+        "Active-dataflow-is-not-running-or-failed": "c215a485-b533-4441-a722-1073be2a7cb8"
+    required_fields:
+      - "dataflow_id"
+      - "cluster"
+      - "error_message"
+    remediation:
+      enabled: true
+      skip_resolution_check: true
+
   # Another example
   "High CPU Usage":
     job_id: "job-id-for-cpu-remediation"

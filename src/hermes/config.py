@@ -43,6 +43,14 @@ class AlertConfig(BaseModel):
         alias="value_mappings",
         description="Conditional mappings based on alert label values"
     )
+    # Job ID mappings - conditionally route to different Rundeck jobs based on alert field values
+    # Structure: {source_field: {field_value: job_id}}
+    # Example: {"error_message": {"Data-collection-vendor-is-down": "job-uuid-1", "Active-dataflow-failed": "job-uuid-2"}}
+    job_id_mappings: Dict[str, Dict[str, str]] = Field(
+        default_factory=dict,
+        alias="job_id_mappings",
+        description="Conditional job routing based on alert field values"
+    )
 
 
 class RemediationConfig(BaseModel):
