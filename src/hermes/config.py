@@ -103,6 +103,11 @@ class SlackConfig(BaseModel):
     noc_user_group: str = Field(default="noc-on-call", description="User group for @mentions")
 
 
+class ApiConfig(BaseModel):
+    """API authentication settings for public endpoints."""
+    webhook_api_key: Optional[str] = Field(default=None, description="API key for public webhook endpoint authentication")
+
+
 class RundeckConfig(BaseModel):
     """Rundeck connection settings - supports token or session-based auth."""
     base_url: str = Field(..., description="Rundeck base URL")
@@ -136,6 +141,7 @@ class Config(BaseModel):
     alertmanager: Optional[AlertmanagerConfig] = Field(default=None)
     jira: Optional[JiraConfig] = Field(default=None)
     slack: Optional[SlackConfig] = Field(default=None)
+    api: Optional[ApiConfig] = Field(default=None, description="API authentication settings")
 
     def get_alert_config(self, alert_name: str) -> Optional[AlertConfig]:
         return self.alert_configs.get(alert_name)

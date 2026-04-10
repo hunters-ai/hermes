@@ -84,8 +84,28 @@ alerts:
     field_mappings:
       cluster: cluster_name
 
+  # Snowflake warehouse queue monitoring
+  'Snowflake Queue High':
+    fields_location: commonLabels
+    job_id: "9d4bf3d9-9c58-483e-9ced-44682ab4bf6f"
+    remediation:
+      enabled: true
+      skip_resolution_check: true  # Snowflake won't send resolved events
+      job_retrigger_cooldown_minutes: 30  # Match Snowflake task frequency (runs every 30 min)
+    required_fields:
+      - warehouse_name
+      - external_oem
+      - account_identifier
+      - region
+    field_mappings:
+      warehouse_name: warehouse
+
 slack:
   enabled: true
   noc_channel: "#alerts-sandbox" # Changed from nocChannel
   noc_user_group: "noc-on-call"
   webhook_url: "${SLACK_WEBHOOK_URL}"
+
+# API authentication for public endpoints
+api:
+  webhook_api_key: "${HERMES_WEBHOOK_API_KEY}"

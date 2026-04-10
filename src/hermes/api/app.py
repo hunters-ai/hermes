@@ -11,8 +11,9 @@ from urllib.parse import urlparse, urlunparse
 from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, HTTPException, status, Response
+from fastapi import FastAPI, Request, HTTPException, status, Response, Header, Depends
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from pydantic import BaseModel, Field
 
@@ -226,6 +227,33 @@ app = FastAPI(
     description="Automated alert remediation orchestrator",
     lifespan=lifespan
 )
+
+
+# API Key authentication for public endpoints
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def verify_api_key(api_key: Optional[str] = Depends(api_key_header)) -> str:
+    """Verify API key for public webhook endpoints."""
+    if not app_config or not app_config.api or not app_config.api.webhook_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="API authentication not configured"
+        )
+    
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing API key in X-API-Key header"
+        )
+    
+    if api_key != app_config.api.webhook_api_key:
+        logger.warning(f"Invalid API key attempt: {api_key[:10]}...")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API key"
+        )
+    
+    return api_key
 
 
 class AlertLabel(BaseModel):
@@ -825,6 +853,193 @@ async def receive_alert(request: Request):
         except Exception as e:
             # Don't fail the request if remediation tracking fails
             logger.error(f"Failed to start remediation tracking: {e}")
+    
+    return {
+        "status": "success", 
+        "message": "Alert processed and sent to webhook",
+        "execution_id": execution_info.get("execution_id"),
+        "workflow_id": workflow_id
+    }
+
+
+@app.post("/api/v1/webhooks/public")
+async def receive_public_webhook(
+    request: Request,
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Public webhook endpoint for external services (e.g., Snowflake).
+    
+    Requires X-API-Key header for authentication.
+    Accepts standard Alertmanager-formatted payloads.
+    """
+    # Use the same logic as /api/v1/alerts but with authentication
+    INCOMING_REQUESTS.inc()
+    
+    if not processor:
+        raise HTTPException(status_code=500, detail="Configuration not loaded")
+
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        PROCESSING_ERRORS.labels(error_type="invalid_json", alert_type="unknown").inc()
+        logger.error("Error parsing alert payload: Invalid JSON")
+        raise HTTPException(status_code=400, detail="Invalid alert payload")
+
+    # Handle resolved events
+    if body.get("status") == "resolved" and remediation_manager:
+        resolved_count = 0
+        for alert in body.get("alerts", []):
+            if alert.get("status") == "resolved":
+                alert_name = alert.get("labels", {}).get("alertname")
+                alert_labels = alert.get("labels", {})
+                if alert_name:
+                    workflow_id = await remediation_manager.handle_resolved_event(
+                        alert_name, alert_labels
+                    )
+                    if workflow_id:
+                        resolved_count += 1
+                        logger.info(f"[Public] Processed resolved event for {alert_name}, workflow: {workflow_id}")
+        
+        return {
+            "status": "success", 
+            "message": "Resolved event processed",
+            "workflows_signaled": resolved_count
+        }
+
+    try:
+        processed_alert, alert_name, missing_fields = processor.process_alert(body)
+    except ValueError as e:
+        logger.error(f"[Public] Error processing alert: {e}")
+        if "no configuration found" in str(e):
+            return JSONResponse(status_code=500, content={"error": f"Error processing alert: {e}"})
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+    logger.info(f"[Public] Received alert: {alert_name}")
+    
+    if os.getenv("DEBUG") == "true":
+        logger.info(f"[Public] Full alert payload for '{alert_name}':\n{json.dumps(body, indent=2)}")
+    
+    if missing_fields:
+        error_msg = f"Missing required fields for Rundeck job: {missing_fields}"
+        logger.error(f"[Public] {error_msg}")
+        return JSONResponse(
+            status_code=400, 
+            content={
+                "error": error_msg,
+                "available_fields": processed_alert
+            }
+        )
+
+    # Check rate limiting
+    alertmanager_source = body.get("externalURL") or body.get("client_url") or "public_webhook"
+    if rate_limiter:
+        allowed, rate_limit_reason = await rate_limiter.try_acquire(alertmanager_source)
+        if not allowed:
+            limit_type = "global" if "Global" in (rate_limit_reason or "") else "per_source"
+            RATE_LIMITED_REQUESTS.labels(source=alertmanager_source[:50], limit_type=limit_type).inc()
+            logger.warning(f"[Public] Rate limited alert '{alert_name}' from {alertmanager_source}: {rate_limit_reason}")
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "status": "rate_limited",
+                    "message": rate_limit_reason,
+                    "alert_name": alert_name,
+                    "source": alertmanager_source
+                }
+            )
+
+    alert_time = str(time.time())
+    alerts_list = body.get("alerts", [])
+    if alerts_list and alerts_list[0].get("startsAt"):
+        alert_time = alerts_list[0].get("startsAt")
+
+    # Check deduplication
+    alert_labels = body.get("commonLabels", {}).copy()
+    alertmanager_url = extract_alertmanager_url(body.get("externalURL") or body.get("client_url"))
+    
+    # Audit log - alert received
+    audit_logger = get_audit_logger()
+    audit_logger.log_alert_received(alert_name, alert_labels, alertmanager_url)
+    
+    if remediation_manager:
+        alert_config = app_config.get_alert_config(alert_name) if app_config else None
+        alert_cooldown = None
+        if alert_config and alert_config.remediation and alert_config.remediation.job_retrigger_cooldown_minutes is not None:
+            alert_cooldown = alert_config.remediation.job_retrigger_cooldown_minutes
+        
+        should_skip, skip_reason, existing_workflow_id = await remediation_manager.check_deduplication(
+            alert_name, alert_labels, alert_cooldown_override=alert_cooldown
+        )
+        if should_skip:
+            reason_label = "active_workflow" if existing_workflow_id else "cooldown_or_limit"
+            ALERTS_DEDUPLICATED.labels(alert_type=alert_name, reason=reason_label).inc()
+            logger.info(f"[Public] Alert '{alert_name}' deduplicated: {skip_reason}")
+            
+            audit_logger.log_alert_deduplicated(alert_name, alert_labels, skip_reason, existing_workflow_id)
+            
+            return {
+                "status": "deduplicated",
+                "message": skip_reason,
+                "existing_workflow_id": existing_workflow_id
+            }
+        
+        # Check circuit breaker
+        is_allowed, cb_reason = remediation_manager.check_circuit_breaker("rundeck")
+        if not is_allowed:
+            CIRCUIT_BREAKER_TRIPS.labels(service="rundeck").inc()
+            logger.warning(f"[Public] Rundeck circuit breaker open for alert '{alert_name}': {cb_reason}")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "circuit_breaker_open",
+                    "message": cb_reason,
+                    "alert_name": alert_name
+                }
+            )
+
+    # Prepare full alert context
+    full_alert_context = {
+        "alert_name": alert_name,
+        "alert_labels": alert_labels,
+        "alert_time": alert_time,
+        "source_alertmanager": alertmanager_url,
+        "processed_options": processed_alert
+    }
+
+    try:
+        execution_info = await processor.send_to_webhook(alert_name, processed_alert, alert_time, full_alert_context)
+        if remediation_manager:
+            remediation_manager.record_circuit_success("rundeck")
+    except Exception as e:
+        if remediation_manager:
+            remediation_manager.record_circuit_failure("rundeck")
+        logger.error(f"[Public] Error sending to webhook: {e}")
+        return JSONResponse(status_code=500, content={"error": f"Error sending to webhook: {e}"})
+
+    logger.info(f"[Public] Sent alert to webhook: {alert_name}")
+    
+    # Start remediation tracking
+    workflow_id = None
+    if remediation_manager and app_config.is_remediation_enabled():
+        try:
+            workflow_id = await remediation_manager.start_remediation(
+                alert_name=alert_name,
+                alert_labels=alert_labels,
+                rundeck_execution_id=execution_info["execution_id"],
+                rundeck_execution_url=execution_info["execution_url"],
+                alertmanager_url=alertmanager_url,
+                rundeck_options=processed_alert
+            )
+            REMEDIATION_WORKFLOWS.labels(alert_type=alert_name).inc()
+            logger.info(f"[Public] Started remediation workflow: {workflow_id}")
+            
+            audit_logger.log_workflow_started(
+                workflow_id, alert_name, alert_labels,
+                execution_info["execution_url"], alertmanager_url
+            )
+        except Exception as e:
+            logger.error(f"[Public] Failed to start remediation tracking: {e}")
     
     return {
         "status": "success", 
