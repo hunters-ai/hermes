@@ -51,6 +51,18 @@ class AlertConfig(BaseModel):
         alias="job_id_mappings",
         description="Conditional job routing based on alert field values"
     )
+    # Split field - trigger separate workflows for each value in a multi-value field
+    # Example: split_field="warehouse_names" with value "WH1, WH2" triggers 2 separate jobs
+    split_field: Optional[str] = Field(
+        default=None,
+        alias="split_field",
+        description="Field containing comma-separated values to split into separate workflows"
+    )
+    split_delimiter: str = Field(
+        default=",",
+        alias="split_delimiter",
+        description="Delimiter used to split the split_field value"
+    )
 
 
 class RemediationConfig(BaseModel):

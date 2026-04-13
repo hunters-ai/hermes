@@ -85,20 +85,27 @@ alerts:
       cluster: cluster_name
 
   # Snowflake warehouse queue monitoring
+  # Supports field splitting - one webhook can contain multiple warehouses
+  # Each warehouse will trigger a separate Rundeck job and remediation workflow
   'Snowflake Queue High':
     fields_location: commonLabels
     job_id: "9d4bf3d9-9c58-483e-9ced-44682ab4bf6f"
+    
+    # Split field configuration - triggers separate jobs for each value
+    split_field: warehouse_names  # Field containing comma-separated warehouse names
+    split_delimiter: ", "          # Delimiter used to split (default: ",")
+    
     remediation:
       enabled: true
       skip_resolution_check: true  # Snowflake won't send resolved events
       job_retrigger_cooldown_minutes: 30  # Match Snowflake task frequency (runs every 30 min)
     required_fields:
-      - warehouse_name
+      - warehouse_names  # Will contain: "UNIFIED_WH, SEARCH_M_WH, INTERACTIVE_WH"
       - external_oem
       - account_identifier
       - region
     field_mappings:
-      warehouse_name: warehouse
+      warehouse_names: warehouse  # Each split value mapped to 'warehouse' option
 
 slack:
   enabled: true

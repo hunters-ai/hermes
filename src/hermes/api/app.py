@@ -289,6 +289,63 @@ class AlertProcessor:
         self.jira = jira
         self.remediation_manager = remediation_manager
 
+    def generate_split_payloads(
+        self, 
+        alert_name: str, 
+        processed_alert: Dict[str, Any], 
+        alert_labels: Dict[str, Any]
+    ) -> List[tuple]:
+        """
+        Generate separate payloads for split field processing.
+        
+        If split_field is configured for the alert, splits the field value and returns
+        a list of (payload, labels) tuples, one for each split value.
+        The split field value is mapped through field_mappings if configured.
+        
+        Returns list of (processed_options, alert_labels) tuples.
+        Returns single-item list with original data if no split configured.
+        """
+        alert_config = self.config.get_alert_config(alert_name)
+        if not alert_config or not alert_config.split_field:
+            return [(processed_alert, alert_labels)]
+        
+        split_field = alert_config.split_field
+        delimiter = alert_config.split_delimiter
+        
+        # Get the target field name (after mapping)
+        target_field = alert_config.field_mappings.get(split_field, split_field)
+        
+        # Get the value to split - check both original and mapped field names
+        split_value = processed_alert.get(target_field) or processed_alert.get(split_field)
+        
+        if not split_value or not isinstance(split_value, str):
+            logger.warning(f"Split field '{split_field}' not found or not a string for alert '{alert_name}'")
+            return [(processed_alert, alert_labels)]
+        
+        # Split the value
+        split_values = [v.strip() for v in split_value.split(delimiter) if v.strip()]
+        
+        if len(split_values) <= 1:
+            logger.debug(f"Split field '{split_field}' has only one value for alert '{alert_name}'")
+            return [(processed_alert, alert_labels)]
+        
+        logger.info(f"Splitting alert '{alert_name}' into {len(split_values)} workflows: {split_values}")
+        
+        # Generate a payload for each split value
+        results = []
+        for value in split_values:
+            # Copy the processed alert and update the split field
+            payload_copy = processed_alert.copy()
+            payload_copy[target_field] = value
+            
+            # Copy labels and update for deduplication
+            labels_copy = alert_labels.copy()
+            labels_copy[f"__split_{split_field}"] = value
+            
+            results.append((payload_copy, labels_copy))
+        
+        return results
+
     def process_alert(self, payload: Dict[str, Any]) -> tuple:
         alert_name = payload.get("commonLabels", {}).get("alertname")
         
@@ -768,31 +825,8 @@ async def receive_alert(request: Request):
     audit_logger = get_audit_logger()
     audit_logger.log_alert_received(alert_name, alert_labels, alertmanager_url)
     
+    # Check circuit breaker for Rundeck (once, before any split processing)
     if remediation_manager:
-        # Get per-alert cooldown override if configured
-        alert_config = app_config.get_alert_config(alert_name) if app_config else None
-        alert_cooldown = None
-        if alert_config and alert_config.remediation and alert_config.remediation.job_retrigger_cooldown_minutes is not None:
-            alert_cooldown = alert_config.remediation.job_retrigger_cooldown_minutes
-        
-        should_skip, skip_reason, existing_workflow_id = await remediation_manager.check_deduplication(
-            alert_name, alert_labels, alert_cooldown_override=alert_cooldown
-        )
-        if should_skip:
-            reason_label = "active_workflow" if existing_workflow_id else "cooldown_or_limit"
-            ALERTS_DEDUPLICATED.labels(alert_type=alert_name, reason=reason_label).inc()
-            logger.info(f"Alert '{alert_name}' deduplicated: {skip_reason}")
-            
-            # Audit log - deduplication
-            audit_logger.log_alert_deduplicated(alert_name, alert_labels, skip_reason, existing_workflow_id)
-            
-            return {
-                "status": "deduplicated",
-                "message": skip_reason,
-                "existing_workflow_id": existing_workflow_id
-            }
-        
-        # Check circuit breaker for Rundeck
         is_allowed, cb_reason = remediation_manager.check_circuit_breaker("rundeck")
         if not is_allowed:
             CIRCUIT_BREAKER_TRIPS.labels(service="rundeck").inc()
@@ -806,59 +840,92 @@ async def receive_alert(request: Request):
                 }
             )
 
-    # Prepare full alert context for audit logging and optional Rundeck payload
-    full_alert_context = {
-        "alert_name": alert_name,
-        "alert_labels": alert_labels,
-        "alert_time": alert_time,
-        "source_alertmanager": alertmanager_url,
-        "processed_options": processed_alert
-    }
-
-    try:
-        execution_info = await processor.send_to_webhook(alert_name, processed_alert, alert_time, full_alert_context)
-        # Record success for circuit breaker
-        if remediation_manager:
-            remediation_manager.record_circuit_success("rundeck")
-    except Exception as e:
-        # Record failure for circuit breaker
-        if remediation_manager:
-            remediation_manager.record_circuit_failure("rundeck")
-        logger.error(f"Error sending to webhook: {e}")
-        logger.error(f"Failed to send processed payload for alert '{alert_name}':\n{json.dumps(processed_alert, indent=2)}")
-        return JSONResponse(status_code=500, content={"error": f"Error sending to webhook: {e}"})
-
-    logger.info(f"Sent alert to webhook: {alert_name}")
+    # Generate split payloads if split_field is configured
+    split_payloads = processor.generate_split_payloads(alert_name, processed_alert, alert_labels)
     
-    # Start remediation tracking if enabled
-    workflow_id = None
-    if remediation_manager and app_config.is_remediation_enabled():
-        try:
-            workflow_id = await remediation_manager.start_remediation(
-                alert_name=alert_name,
-                alert_labels=alert_labels,
-                rundeck_execution_id=execution_info["execution_id"],
-                rundeck_execution_url=execution_info["execution_url"],
-                alertmanager_url=alertmanager_url,
-                rundeck_options=processed_alert
-            )
-            REMEDIATION_WORKFLOWS.labels(alert_type=alert_name).inc()
-            logger.info(f"Started remediation workflow: {workflow_id} (AM: {alertmanager_url})")
+    # Process each split payload
+    results = []
+    for payload, labels in split_payloads:
+        # Check deduplication for this specific payload/labels combination
+        if remediation_manager:
+            alert_config = app_config.get_alert_config(alert_name) if app_config else None
+            alert_cooldown = None
+            if alert_config and alert_config.remediation and alert_config.remediation.job_retrigger_cooldown_minutes is not None:
+                alert_cooldown = alert_config.remediation.job_retrigger_cooldown_minutes
             
-            # Audit log - workflow started with execution URL
-            audit_logger.log_workflow_started(
-                workflow_id, alert_name, alert_labels,
-                execution_info["execution_url"], alertmanager_url
+            should_skip, skip_reason, existing_workflow_id = await remediation_manager.check_deduplication(
+                alert_name, labels, alert_cooldown_override=alert_cooldown
             )
+            if should_skip:
+                reason_label = "active_workflow" if existing_workflow_id else "cooldown_or_limit"
+                ALERTS_DEDUPLICATED.labels(alert_type=alert_name, reason=reason_label).inc()
+                logger.info(f"Alert '{alert_name}' deduplicated: {skip_reason}")
+                audit_logger.log_alert_deduplicated(alert_name, labels, skip_reason, existing_workflow_id)
+                results.append({
+                    "status": "deduplicated",
+                    "message": skip_reason,
+                    "existing_workflow_id": existing_workflow_id
+                })
+                continue
+
+        # Prepare full alert context for this split payload
+        full_alert_context = {
+            "alert_name": alert_name,
+            "alert_labels": labels,
+            "alert_time": alert_time,
+            "source_alertmanager": alertmanager_url,
+            "processed_options": payload
+        }
+
+        try:
+            execution_info = await processor.send_to_webhook(alert_name, payload, alert_time, full_alert_context)
+            if remediation_manager:
+                remediation_manager.record_circuit_success("rundeck")
         except Exception as e:
-            # Don't fail the request if remediation tracking fails
-            logger.error(f"Failed to start remediation tracking: {e}")
+            if remediation_manager:
+                remediation_manager.record_circuit_failure("rundeck")
+            logger.error(f"Error sending to webhook: {e}")
+            results.append({"status": "error", "error": str(e)})
+            continue
+
+        logger.info(f"Sent alert to webhook: {alert_name}")
+
+        # Start remediation tracking if enabled
+        workflow_id = None
+        if remediation_manager and app_config.is_remediation_enabled():
+            try:
+                workflow_id = await remediation_manager.start_remediation(
+                    alert_name=alert_name,
+                    alert_labels=labels,
+                    rundeck_execution_id=execution_info["execution_id"],
+                    rundeck_execution_url=execution_info["execution_url"],
+                    alertmanager_url=alertmanager_url,
+                    rundeck_options=payload
+                )
+                REMEDIATION_WORKFLOWS.labels(alert_type=alert_name).inc()
+                logger.info(f"Started remediation workflow: {workflow_id} (AM: {alertmanager_url})")
+                audit_logger.log_workflow_started(
+                    workflow_id, alert_name, labels,
+                    execution_info["execution_url"], alertmanager_url
+                )
+            except Exception as e:
+                logger.error(f"Failed to start remediation tracking: {e}")
+
+        results.append({
+            "status": "success",
+            "execution_id": execution_info.get("execution_id"),
+            "workflow_id": workflow_id
+        })
+
+    # Return appropriate response based on results
+    if len(results) == 1:
+        return results[0]
     
+    success_count = sum(1 for r in results if r.get("status") == "success")
     return {
-        "status": "success", 
-        "message": "Alert processed and sent to webhook",
-        "execution_id": execution_info.get("execution_id"),
-        "workflow_id": workflow_id
+        "status": "success" if success_count > 0 else "failed",
+        "message": f"Processed {len(results)} split workflows, {success_count} triggered",
+        "workflows": results
     }
 
 
@@ -962,29 +1029,8 @@ async def receive_public_webhook(
     audit_logger = get_audit_logger()
     audit_logger.log_alert_received(alert_name, alert_labels, alertmanager_url)
     
+    # Check circuit breaker for Rundeck (once, before any split processing)
     if remediation_manager:
-        alert_config = app_config.get_alert_config(alert_name) if app_config else None
-        alert_cooldown = None
-        if alert_config and alert_config.remediation and alert_config.remediation.job_retrigger_cooldown_minutes is not None:
-            alert_cooldown = alert_config.remediation.job_retrigger_cooldown_minutes
-        
-        should_skip, skip_reason, existing_workflow_id = await remediation_manager.check_deduplication(
-            alert_name, alert_labels, alert_cooldown_override=alert_cooldown
-        )
-        if should_skip:
-            reason_label = "active_workflow" if existing_workflow_id else "cooldown_or_limit"
-            ALERTS_DEDUPLICATED.labels(alert_type=alert_name, reason=reason_label).inc()
-            logger.info(f"[Public] Alert '{alert_name}' deduplicated: {skip_reason}")
-            
-            audit_logger.log_alert_deduplicated(alert_name, alert_labels, skip_reason, existing_workflow_id)
-            
-            return {
-                "status": "deduplicated",
-                "message": skip_reason,
-                "existing_workflow_id": existing_workflow_id
-            }
-        
-        # Check circuit breaker
         is_allowed, cb_reason = remediation_manager.check_circuit_breaker("rundeck")
         if not is_allowed:
             CIRCUIT_BREAKER_TRIPS.labels(service="rundeck").inc()
@@ -998,54 +1044,92 @@ async def receive_public_webhook(
                 }
             )
 
-    # Prepare full alert context
-    full_alert_context = {
-        "alert_name": alert_name,
-        "alert_labels": alert_labels,
-        "alert_time": alert_time,
-        "source_alertmanager": alertmanager_url,
-        "processed_options": processed_alert
-    }
-
-    try:
-        execution_info = await processor.send_to_webhook(alert_name, processed_alert, alert_time, full_alert_context)
-        if remediation_manager:
-            remediation_manager.record_circuit_success("rundeck")
-    except Exception as e:
-        if remediation_manager:
-            remediation_manager.record_circuit_failure("rundeck")
-        logger.error(f"[Public] Error sending to webhook: {e}")
-        return JSONResponse(status_code=500, content={"error": f"Error sending to webhook: {e}"})
-
-    logger.info(f"[Public] Sent alert to webhook: {alert_name}")
+    # Generate split payloads if split_field is configured
+    split_payloads = processor.generate_split_payloads(alert_name, processed_alert, alert_labels)
     
-    # Start remediation tracking
-    workflow_id = None
-    if remediation_manager and app_config.is_remediation_enabled():
-        try:
-            workflow_id = await remediation_manager.start_remediation(
-                alert_name=alert_name,
-                alert_labels=alert_labels,
-                rundeck_execution_id=execution_info["execution_id"],
-                rundeck_execution_url=execution_info["execution_url"],
-                alertmanager_url=alertmanager_url,
-                rundeck_options=processed_alert
-            )
-            REMEDIATION_WORKFLOWS.labels(alert_type=alert_name).inc()
-            logger.info(f"[Public] Started remediation workflow: {workflow_id}")
+    # Process each split payload
+    results = []
+    for payload, labels in split_payloads:
+        # Check deduplication for this specific payload/labels combination
+        if remediation_manager:
+            alert_config = app_config.get_alert_config(alert_name) if app_config else None
+            alert_cooldown = None
+            if alert_config and alert_config.remediation and alert_config.remediation.job_retrigger_cooldown_minutes is not None:
+                alert_cooldown = alert_config.remediation.job_retrigger_cooldown_minutes
             
-            audit_logger.log_workflow_started(
-                workflow_id, alert_name, alert_labels,
-                execution_info["execution_url"], alertmanager_url
+            should_skip, skip_reason, existing_workflow_id = await remediation_manager.check_deduplication(
+                alert_name, labels, alert_cooldown_override=alert_cooldown
             )
+            if should_skip:
+                reason_label = "active_workflow" if existing_workflow_id else "cooldown_or_limit"
+                ALERTS_DEDUPLICATED.labels(alert_type=alert_name, reason=reason_label).inc()
+                logger.info(f"[Public] Alert '{alert_name}' deduplicated: {skip_reason}")
+                audit_logger.log_alert_deduplicated(alert_name, labels, skip_reason, existing_workflow_id)
+                results.append({
+                    "status": "deduplicated",
+                    "message": skip_reason,
+                    "existing_workflow_id": existing_workflow_id
+                })
+                continue
+
+        # Prepare full alert context for this split payload
+        full_alert_context = {
+            "alert_name": alert_name,
+            "alert_labels": labels,
+            "alert_time": alert_time,
+            "source_alertmanager": alertmanager_url,
+            "processed_options": payload
+        }
+
+        try:
+            execution_info = await processor.send_to_webhook(alert_name, payload, alert_time, full_alert_context)
+            if remediation_manager:
+                remediation_manager.record_circuit_success("rundeck")
         except Exception as e:
-            logger.error(f"[Public] Failed to start remediation tracking: {e}")
+            if remediation_manager:
+                remediation_manager.record_circuit_failure("rundeck")
+            logger.error(f"[Public] Error sending to webhook: {e}")
+            results.append({"status": "error", "error": str(e)})
+            continue
+
+        logger.info(f"[Public] Sent alert to webhook: {alert_name}")
+
+        # Start remediation tracking
+        workflow_id = None
+        if remediation_manager and app_config.is_remediation_enabled():
+            try:
+                workflow_id = await remediation_manager.start_remediation(
+                    alert_name=alert_name,
+                    alert_labels=labels,
+                    rundeck_execution_id=execution_info["execution_id"],
+                    rundeck_execution_url=execution_info["execution_url"],
+                    alertmanager_url=alertmanager_url,
+                    rundeck_options=payload
+                )
+                REMEDIATION_WORKFLOWS.labels(alert_type=alert_name).inc()
+                logger.info(f"[Public] Started remediation workflow: {workflow_id}")
+                audit_logger.log_workflow_started(
+                    workflow_id, alert_name, labels,
+                    execution_info["execution_url"], alertmanager_url
+                )
+            except Exception as e:
+                logger.error(f"[Public] Failed to start remediation tracking: {e}")
+
+        results.append({
+            "status": "success",
+            "execution_id": execution_info.get("execution_id"),
+            "workflow_id": workflow_id
+        })
+
+    # Return appropriate response based on results
+    if len(results) == 1:
+        return results[0]
     
+    success_count = sum(1 for r in results if r.get("status") == "success")
     return {
-        "status": "success", 
-        "message": "Alert processed and sent to webhook",
-        "execution_id": execution_info.get("execution_id"),
-        "workflow_id": workflow_id
+        "status": "success" if success_count > 0 else "failed",
+        "message": f"Processed {len(results)} split workflows, {success_count} triggered",
+        "workflows": results
     }
 
 
