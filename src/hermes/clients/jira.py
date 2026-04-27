@@ -4,6 +4,8 @@ from typing import Optional, Dict, Any, List
 import httpx
 from base64 import b64encode
 
+from hermes.utils.metrics import ExternalService, track_call
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,18 +69,19 @@ class JiraClient:
         if visibility:
             body["visibility"] = visibility
         
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(url, headers=self._get_headers(), json=body)
-                response.raise_for_status()
-                result = response.json()
-                logger.info(f"Added comment to JIRA ticket {ticket_id}")
-                return result
-            except httpx.HTTPError as e:
-                logger.error(f"Error adding comment to JIRA {ticket_id}: {e}")
-                if hasattr(e, 'response') and e.response is not None:
-                    logger.error(f"Response: {e.response.text}")
-                raise
+        async with track_call(ExternalService.JIRA, "add_comment"):
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.post(url, headers=self._get_headers(), json=body)
+                    response.raise_for_status()
+                    result = response.json()
+                    logger.info(f"Added comment to JIRA ticket {ticket_id}")
+                    return result
+                except httpx.HTTPError as e:
+                    logger.error(f"Error adding comment to JIRA {ticket_id}: {e}")
+                    if hasattr(e, 'response') and e.response is not None:
+                        logger.error(f"Response: {e.response.text}")
+                    raise
     
     async def add_remediation_success_comment(
         self, 
@@ -130,16 +133,17 @@ class JiraClient:
         """Get ticket details."""
         url = f"{self.base_url}/rest/api/3/issue/{ticket_id}"
         
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(url, headers=self._get_headers())
-                response.raise_for_status()
-                return response.json()
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 404:
-                    logger.warning(f"JIRA ticket {ticket_id} not found")
-                    return None
-                raise
+        async with track_call(ExternalService.JIRA, "get_ticket"):
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.get(url, headers=self._get_headers())
+                    response.raise_for_status()
+                    return response.json()
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        logger.warning(f"JIRA ticket {ticket_id} not found")
+                        return None
+                    raise
     
     async def search_tickets(
         self, 
@@ -166,19 +170,20 @@ class JiraClient:
             "fields": fields or ["key", "summary", "created"]
         }
         
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(url, headers=self._get_headers(), json=payload)
-                response.raise_for_status()
-                result = response.json()
-                issues = result.get("issues", [])
-                logger.info(f"JQL search returned {len(issues)} tickets (max: {max_results})")
-                return issues
-            except httpx.HTTPError as e:
-                logger.error(f"Error searching JIRA tickets: {e}")
-                if hasattr(e, 'response') and e.response is not None:
-                    logger.error(f"Response: {e.response.text}")
-                raise
+        async with track_call(ExternalService.JIRA, "search_tickets"):
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.post(url, headers=self._get_headers(), json=payload)
+                    response.raise_for_status()
+                    result = response.json()
+                    issues = result.get("issues", [])
+                    logger.info(f"JQL search returned {len(issues)} tickets (max: {max_results})")
+                    return issues
+                except httpx.HTTPError as e:
+                    logger.error(f"Error searching JIRA tickets: {e}")
+                    if hasattr(e, 'response') and e.response is not None:
+                        logger.error(f"Response: {e.response.text}")
+                    raise
     
     async def find_ticket_by_summary(
         self, 

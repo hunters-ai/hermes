@@ -228,7 +228,7 @@ class TestResumeWorkflow:
         
         # Mock job completion and alert resolution
         manager._wait_for_job_completion = AsyncMock(return_value=True)
-        manager._wait_for_alert_resolution = AsyncMock(return_value=True)
+        manager._wait_for_alert_resolution = AsyncMock(return_value=(True, "webhook"))
         manager._handle_success = AsyncMock()
         
         await manager._resume_workflow(workflow)
@@ -271,7 +271,7 @@ class TestResumeWorkflow:
         
         manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
         
-        manager._wait_for_alert_resolution = AsyncMock(return_value=True)
+        manager._wait_for_alert_resolution = AsyncMock(return_value=(True, "webhook"))
         manager._handle_success = AsyncMock()
         
         await manager._resume_workflow(workflow)

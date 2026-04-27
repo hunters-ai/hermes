@@ -3,6 +3,8 @@ import logging
 from typing import Dict, List, Optional, Any
 import httpx
 
+from hermes.utils.metrics import ExternalService, track_call
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,15 +39,16 @@ class AlertmanagerClient:
                 # Each filter is a separate query param with format: label="value"
                 query_params.append(("filter", f'{key}="{value}"'))
         
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(url, headers=self._get_headers(), params=query_params)
-                response.raise_for_status()
-                alerts = response.json()
-                return alerts
-            except httpx.HTTPError as e:
-                logger.error(f"Error fetching alerts from Alertmanager: {e}")
-                raise
+        async with track_call(ExternalService.ALERTMANAGER, "get_alerts"):
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.get(url, headers=self._get_headers(), params=query_params)
+                    response.raise_for_status()
+                    alerts = response.json()
+                    return alerts
+                except httpx.HTTPError as e:
+                    logger.error(f"Error fetching alerts from Alertmanager: {e}")
+                    raise
     
     async def is_alert_firing(
         self, 

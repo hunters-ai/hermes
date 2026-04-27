@@ -1,118 +1,230 @@
-"""Tests for Prometheus metrics (P2)."""
+"""Tests for Prometheus metrics."""
 import os
+from unittest.mock import MagicMock
+
 import pytest
-from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
 # Set config path before importing app
 os.environ.setdefault("CONFIG_PATH", "config/config.yaml")
 
 from hermes.api.app import app
-from hermes.core.remediation_manager import RemediationManager
 from hermes.config import Config, RemediationConfig
-from hermes.core.state_store import InMemoryStateStore
+from hermes.core.remediation_manager import RemediationManager
+from hermes.core.state_store import (
+    InMemoryStateStore,
+    RemediationState,
+    RemediationWorkflow,
+)
+from hermes.utils import metrics as m
 
 
-class TestPrometheusMetrics:
-    """Tests for Prometheus metrics endpoint."""
-    
-    @pytest.fixture
-    def client(self):
-        """Create test client."""
-        return TestClient(app)
-    
+# --- Endpoint smoke ---------------------------------------------------------
+
+EXPECTED_METRIC_FAMILIES = [
+    # HTTP
+    "hermes_incoming_requests_total",
+    "hermes_processing_duration_seconds",
+    # Intake / dedup
+    "hermes_alerts_received_total",
+    "hermes_processing_errors_total",
+    "hermes_alerts_deduplicated_total",
+    "hermes_concurrency_limit_hit_total",
+    "hermes_rate_limited_requests_total",
+    # Lifecycle
+    "hermes_remediation_workflows_total",
+    "hermes_remediation_outcomes_total",
+    "hermes_remediation_retries_total",
+    "hermes_resolution_source_total",
+    "hermes_workflow_recovery_total",
+    "hermes_active_workflows",
+    # Durations
+    "hermes_remediation_duration_seconds",
+    "hermes_job_execution_duration_seconds",
+    "hermes_alert_resolution_wait_seconds",
+    # External
+    "hermes_external_call_duration_seconds",
+    "hermes_external_call_errors_total",
+    "hermes_rundeck_job_triggers_total",
+    "hermes_jira_operations_total",
+    "hermes_jira_ticket_fetch_total",
+    # Reliability
+    "hermes_circuit_breaker_trips_total",
+    "hermes_circuit_breaker_state",
+    # Notifications
+    "hermes_escalations_sent_total",
+    "hermes_slack_notifications_total",
+    # Build info
+    "hermes_build_info",
+]
+
+
+DEAD_METRICS = [
+    "hermes_webhook_requests_total",
+    "hermes_webhook_errors_total",
+]
+
+
+@pytest.fixture
+def client():
+    return TestClient(app)
+
+
+class TestMetricsEndpoint:
     def test_metrics_endpoint_exists(self, client):
-        """Metrics endpoint should be accessible."""
         response = client.get("/metrics")
         assert response.status_code == 200
-    
-    def test_metrics_contains_incoming_requests(self, client):
-        """Should contain incoming requests counter."""
+
+    @pytest.mark.parametrize("metric", EXPECTED_METRIC_FAMILIES)
+    def test_metric_family_exposed(self, client, metric):
         response = client.get("/metrics")
-        assert "hermes_incoming_requests_total" in response.text
-    
-    def test_metrics_contains_webhook_requests(self, client):
-        """Should contain webhook requests counter."""
+        assert metric in response.text, f"missing metric {metric}"
+
+    @pytest.mark.parametrize("metric", DEAD_METRICS)
+    def test_dead_metrics_are_gone(self, client, metric):
         response = client.get("/metrics")
-        assert "hermes_webhook_requests_total" in response.text
-    
-    def test_metrics_contains_processing_duration(self, client):
-        """Should contain processing duration histogram."""
-        response = client.get("/metrics")
-        assert "hermes_processing_duration_seconds" in response.text
-    
-    def test_metrics_contains_rundeck_job_triggers(self, client):
-        """Should contain Rundeck job triggers counter."""
-        response = client.get("/metrics")
-        assert "hermes_rundeck_job_triggers_total" in response.text
-    
-    def test_metrics_contains_remediation_workflows(self, client):
-        """Should contain remediation workflows counter."""
-        response = client.get("/metrics")
-        assert "hermes_remediation_workflows_total" in response.text
-    
-    def test_metrics_contains_deduplicated_counter(self, client):
-        """Should contain alerts deduplicated counter (P0)."""
-        response = client.get("/metrics")
-        assert "hermes_alerts_deduplicated_total" in response.text
-    
-    def test_metrics_contains_circuit_breaker_counter(self, client):
-        """Should contain circuit breaker trips counter (P0)."""
-        response = client.get("/metrics")
-        assert "hermes_circuit_breaker_trips_total" in response.text
-    
-    def test_metrics_contains_remediation_outcomes(self, client):
-        """Should contain remediation outcomes counter (P2)."""
-        response = client.get("/metrics")
-        assert "hermes_remediation_outcomes_total" in response.text
-    
-    def test_metrics_contains_rate_limited_counter(self, client):
-        """Should contain rate limited requests counter (P3)."""
-        response = client.get("/metrics")
-        assert "hermes_rate_limited_requests_total" in response.text
+        assert metric not in response.text, f"unexpected dead metric {metric}"
 
 
-class TestMetricsCallback:
-    """Tests for metrics callback in RemediationManager."""
-    
-    def test_record_outcome_calls_callback(self):
-        """Should call metrics callback when recording outcome."""
-        mock_callback = MagicMock()
-        
-        config = MagicMock(spec=Config)
-        config.remediation = RemediationConfig()
-        config.alertmanager = None
-        config.jira = None
-        config.slack = None
-        
-        manager = RemediationManager(
-            config,
-            InMemoryStateStore(),
-            MagicMock(),
-            metrics_callback=mock_callback
+# --- Outcome bookkeeping ----------------------------------------------------
+
+def _counter_value(counter, **labels) -> float:
+    sample = counter.labels(**labels)
+    return sample._value.get()  # type: ignore[attr-defined]
+
+
+def _make_manager() -> RemediationManager:
+    config = MagicMock(spec=Config)
+    config.remediation = RemediationConfig()
+    config.alertmanager = None
+    config.jira = None
+    config.slack = None
+    config.get_alert_config.return_value = None
+    return RemediationManager(config, InMemoryStateStore(), rundeck_client=None)
+
+
+class TestOutcomeRecording:
+    def test_record_outcome_increments_counter(self):
+        manager = _make_manager()
+        before = _counter_value(
+            m.REMEDIATION_OUTCOMES,
+            alert_type="UnitTestAlert",
+            outcome="success",
+            attempts="1",
         )
-        
-        manager._record_outcome("TestAlert", "success")
-        
-        mock_callback.assert_called_once_with("TestAlert", "success")
-    
-    def test_record_outcome_handles_callback_exception(self):
-        """Should handle callback exceptions gracefully."""
-        def failing_callback(alert_name, outcome):
-            raise Exception("Callback failed")
-        
-        config = MagicMock(spec=Config)
-        config.remediation = RemediationConfig()
-        config.alertmanager = None
-        config.jira = None
-        config.slack = None
-        
-        manager = RemediationManager(
-            config,
-            InMemoryStateStore(),
-            MagicMock(),
-            metrics_callback=failing_callback
+
+        manager._record_outcome("UnitTestAlert", "success", attempts=1)
+
+        after = _counter_value(
+            m.REMEDIATION_OUTCOMES,
+            alert_type="UnitTestAlert",
+            outcome="success",
+            attempts="1",
         )
-        
-        # Should not raise exception
-        manager._record_outcome("TestAlert", "failure")
+        assert after == before + 1
+
+    def test_record_outcome_swallows_metric_failure(self, monkeypatch):
+        """A broken metric backend must never break the workflow."""
+        manager = _make_manager()
+
+        class _BoomCounter:
+            def labels(self, **_):
+                raise RuntimeError("metrics backend down")
+
+        monkeypatch.setattr(m, "REMEDIATION_OUTCOMES", _BoomCounter())
+
+        # No exception should escape.
+        manager._record_outcome("UnitTestAlert", "success", attempts=1)
+
+
+class TestTerminalRecording:
+    def test_terminal_records_outcome_and_duration(self):
+        manager = _make_manager()
+        wf = RemediationWorkflow(
+            id="wf-1",
+            alert_name="DurationAlert",
+            alert_labels={},
+            state=RemediationState.JOB_SUCCEEDED,
+            attempts=2,
+        )
+
+        before = _counter_value(
+            m.REMEDIATION_OUTCOMES,
+            alert_type="DurationAlert",
+            outcome="success",
+            attempts="2",
+        )
+        hist_before = m.REMEDIATION_DURATION.labels(
+            alert_type="DurationAlert", outcome="success"
+        )._sum.get()  # type: ignore[attr-defined]
+
+        manager._record_terminal(wf, "success")
+
+        after = _counter_value(
+            m.REMEDIATION_OUTCOMES,
+            alert_type="DurationAlert",
+            outcome="success",
+            attempts="2",
+        )
+        hist_after = m.REMEDIATION_DURATION.labels(
+            alert_type="DurationAlert", outcome="success"
+        )._sum.get()  # type: ignore[attr-defined]
+
+        assert after == before + 1
+        assert hist_after >= hist_before  # duration sum monotonically grows
+
+
+class TestCircuitBreakerGauge:
+    def test_gauge_flips_on_open_and_close(self):
+        manager = _make_manager()
+        # Force threshold to 1 so a single failure trips the breaker.
+        manager.circuit_failure_threshold = 1
+
+        manager.record_circuit_failure(m.ExternalService.RUNDECK)
+        gauge_open = m.CIRCUIT_BREAKER_STATE.labels(
+            service=m.ExternalService.RUNDECK
+        )._value.get()  # type: ignore[attr-defined]
+        assert gauge_open == 1
+
+        manager.record_circuit_success(m.ExternalService.RUNDECK)
+        gauge_closed = m.CIRCUIT_BREAKER_STATE.labels(
+            service=m.ExternalService.RUNDECK
+        )._value.get()  # type: ignore[attr-defined]
+        assert gauge_closed == 0
+
+
+class TestTrackCall:
+    @pytest.mark.asyncio
+    async def test_track_call_records_success(self):
+        before = m.EXTERNAL_CALL_DURATION.labels(
+            service="rundeck", operation="unit_test", status="success"
+        )._sum.get()  # type: ignore[attr-defined]
+
+        async with m.track_call("rundeck", "unit_test"):
+            pass
+
+        after = m.EXTERNAL_CALL_DURATION.labels(
+            service="rundeck", operation="unit_test", status="success"
+        )._sum.get()  # type: ignore[attr-defined]
+        assert after >= before
+
+    @pytest.mark.asyncio
+    async def test_track_call_records_error(self):
+        before = _counter_value(
+            m.EXTERNAL_CALL_ERRORS,
+            service="rundeck",
+            operation="unit_test_error",
+            error_type="ValueError",
+        )
+
+        with pytest.raises(ValueError):
+            async with m.track_call("rundeck", "unit_test_error"):
+                raise ValueError("boom")
+
+        after = _counter_value(
+            m.EXTERNAL_CALL_ERRORS,
+            service="rundeck",
+            operation="unit_test_error",
+            error_type="ValueError",
+        )
+        assert after == before + 1

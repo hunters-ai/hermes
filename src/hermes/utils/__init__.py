@@ -1,5 +1,6 @@
 """Utility modules for Hermes."""
 
+from . import metrics
 from .audit_logger import AuditLogger, get_audit_logger, AuditEventType
 from .rate_limiter import RateLimiter, TokenBucket, RateLimitConfig
 
@@ -10,4 +11,5 @@ __all__ = [
     "RateLimiter",
     "TokenBucket",
     "RateLimitConfig",
+    "metrics",
 ]

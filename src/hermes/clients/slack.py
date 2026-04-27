@@ -3,6 +3,8 @@ import logging
 from typing import Optional, Dict, Any, List
 import httpx
 
+from hermes.utils.metrics import ExternalService, track_call
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,15 +55,16 @@ class SlackClient:
         if blocks:
             payload["blocks"] = blocks
         
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(self.webhook_url, json=payload)
-                response.raise_for_status()
-                logger.info("Sent Slack message via webhook")
-                return True
-            except httpx.HTTPError as e:
-                logger.error(f"Error sending Slack webhook: {e}")
-                return False
+        async with track_call(ExternalService.SLACK, "webhook_post"):
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.post(self.webhook_url, json=payload)
+                    response.raise_for_status()
+                    logger.info("Sent Slack message via webhook")
+                    return True
+                except httpx.HTTPError as e:
+                    logger.error(f"Error sending Slack webhook: {e}")
+                    return False
     
     async def _send_via_bot(
         self, 
@@ -83,20 +86,21 @@ class SlackClient:
         if blocks:
             payload["blocks"] = blocks
         
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(url, headers=headers, json=payload)
-                response.raise_for_status()
-                result = response.json()
-                if result.get("ok"):
-                    logger.info(f"Sent Slack message to {channel}")
-                    return True
-                else:
-                    logger.error(f"Slack API error: {result.get('error')}")
+        async with track_call(ExternalService.SLACK, "chat_post_message"):
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.post(url, headers=headers, json=payload)
+                    response.raise_for_status()
+                    result = response.json()
+                    if result.get("ok"):
+                        logger.info(f"Sent Slack message to {channel}")
+                        return True
+                    else:
+                        logger.error(f"Slack API error: {result.get('error')}")
+                        return False
+                except httpx.HTTPError as e:
+                    logger.error(f"Error sending Slack message: {e}")
                     return False
-            except httpx.HTTPError as e:
-                logger.error(f"Error sending Slack message: {e}")
-                return False
     
     async def send_escalation(
         self,

@@ -1,0 +1,365 @@
+"""
+Prometheus metrics definitions for Hermes.
+
+Single source of truth for every metric the service exposes. Imported by the
+API layer, the remediation manager, and the external clients to instrument
+their behavior.
+
+Label cardinality is kept bounded by:
+- ``alert_type``: closed set, derived from ``config.yaml``.
+- ``outcome``: closed enum (see ``RemediationOutcome``).
+- ``service`` / ``operation``: closed enum (one entry per client method we
+  care about).
+- ``attempts`` / ``attempt_number``: bounded by ``remediation.max_attempts``.
+- ``endpoint``: closed set of FastAPI routes.
+- ``state``: ``RemediationState`` enum.
+- ``target`` / ``result`` / ``source`` / ``method`` / ``type`` / ``status`` /
+  ``error_type`` are all small closed sets defined in this module.
+
+Never use raw exception messages or user-controlled strings as label values.
+"""
+from __future__ import annotations
+
+import contextlib
+import logging
+import time
+from typing import AsyncIterator, Iterable, Optional
+
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, REGISTRY
+
+logger = logging.getLogger(__name__)
+
+
+# Closed set of remediation outcomes. Anything else is a programming error.
+class RemediationOutcome:
+    SUCCESS = "success"
+    JOB_SUCCESS_NO_RESOLUTION_CHECK = "job_success_no_resolution_check"
+    JOB_FAILED = "job_failed"
+    ALERT_STILL_FIRING = "alert_still_firing"
+    ESCALATED = "escalated"
+    RETRIGGER_FAILED = "retrigger_failed"
+    MISSING_OPTIONS = "missing_options"
+
+
+class ResolutionSource:
+    WEBHOOK = "webhook"
+    POLLING = "polling"
+    SKIPPED = "skip_resolution_check"
+    TIMEOUT = "timeout"
+
+
+class ExternalService:
+    RUNDECK = "rundeck"
+    ALERTMANAGER = "alertmanager"
+    JIRA = "jira"
+    SLACK = "slack"
+    DYNAMODB = "dynamodb"
+
+
+# ---------------------------------------------------------------------------
+# HTTP layer
+# ---------------------------------------------------------------------------
+INCOMING_REQUESTS = Counter(
+    "hermes_incoming_requests_total",
+    "Incoming HTTP requests handled by Hermes, by route and outcome.",
+    ["endpoint", "status"],
+)
+
+PROCESSING_DURATION = Histogram(
+    "hermes_processing_duration_seconds",
+    "End-to-end latency of HTTP requests, by route.",
+    ["endpoint"],
+    buckets=(0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+)
+
+
+# ---------------------------------------------------------------------------
+# Alert intake / dedup
+# ---------------------------------------------------------------------------
+ALERTS_RECEIVED_BY_TYPE = Counter(
+    "hermes_alerts_received_total",
+    "Alerts received per alert type.",
+    ["alert_type"],
+)
+
+PROCESSING_ERRORS = Counter(
+    "hermes_processing_errors_total",
+    "Errors raised while processing inbound alerts.",
+    ["error_type", "alert_type"],
+)
+
+ALERTS_DEDUPLICATED = Counter(
+    "hermes_alerts_deduplicated_total",
+    "Alerts dropped because of an active workflow or cooldown.",
+    ["alert_type", "reason"],
+)
+
+CONCURRENCY_LIMIT_HIT = Counter(
+    "hermes_concurrency_limit_hit_total",
+    "Alerts rejected because the global concurrent-workflow cap was reached.",
+    ["alert_type"],
+)
+
+RATE_LIMITED_REQUESTS = Counter(
+    "hermes_rate_limited_requests_total",
+    "Requests rejected by the per-source / global rate limiter.",
+    ["source", "limit_type"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Workflow lifecycle
+# ---------------------------------------------------------------------------
+REMEDIATION_WORKFLOWS = Counter(
+    "hermes_remediation_workflows_total",
+    "Remediation workflows started.",
+    ["alert_type"],
+)
+
+REMEDIATION_OUTCOMES = Counter(
+    "hermes_remediation_outcomes_total",
+    "Remediation outcomes by alert type, outcome, and number of attempts at "
+    "terminal time. ``attempts`` lets you compute first-attempt success rate "
+    "without a separate metric.",
+    ["alert_type", "outcome", "attempts"],
+)
+
+REMEDIATION_RETRIES = Counter(
+    "hermes_remediation_retries_total",
+    "Retry attempts initiated for a remediation workflow. ``attempt_number`` "
+    "is the new attempt number being started (e.g. ``2`` for the first retry).",
+    ["alert_type", "attempt_number"],
+)
+
+RESOLUTION_SOURCE = Counter(
+    "hermes_resolution_source_total",
+    "How an alert resolution was determined.",
+    ["alert_type", "source"],
+)
+
+WORKFLOW_RECOVERY = Counter(
+    "hermes_workflow_recovery_total",
+    "Outcomes of workflow recovery on service restart.",
+    ["outcome"],
+)
+
+ACTIVE_WORKFLOWS = Gauge(
+    "hermes_active_workflows",
+    "Current number of in-flight remediation workflows.",
+)
+
+REMEDIATION_DURATION = Histogram(
+    "hermes_remediation_duration_seconds",
+    "Workflow lifecycle duration from creation to terminal state.",
+    ["alert_type", "outcome"],
+    buckets=(60, 300, 600, 1800, 3600, 7200, 14400),
+)
+
+JOB_EXECUTION_DURATION = Histogram(
+    "hermes_job_execution_duration_seconds",
+    "Time from Rundeck job trigger to terminal job status.",
+    ["alert_type", "status"],
+    buckets=(10, 30, 60, 300, 600, 1800),
+)
+
+ALERT_RESOLUTION_WAIT = Histogram(
+    "hermes_alert_resolution_wait_seconds",
+    "Time from job success to alert resolution (or timeout).",
+    ["alert_type", "method"],
+    buckets=(10, 30, 60, 300, 600, 1800),
+)
+
+
+# ---------------------------------------------------------------------------
+# Rundeck job triggering
+# ---------------------------------------------------------------------------
+RUNDECK_JOB_TRIGGERS = Counter(
+    "hermes_rundeck_job_triggers_total",
+    "Rundeck job trigger attempts, by alert type and outcome.",
+    ["alert_type", "status"],
+)
+
+
+# ---------------------------------------------------------------------------
+# External service calls (latency + error breakdown)
+# ---------------------------------------------------------------------------
+EXTERNAL_CALL_DURATION = Histogram(
+    "hermes_external_call_duration_seconds",
+    "External service call latency.",
+    ["service", "operation", "status"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30),
+)
+
+EXTERNAL_CALL_ERRORS = Counter(
+    "hermes_external_call_errors_total",
+    "External service call failures.",
+    ["service", "operation", "error_type"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Reliability / circuit breakers
+# ---------------------------------------------------------------------------
+CIRCUIT_BREAKER_TRIPS = Counter(
+    "hermes_circuit_breaker_trips_total",
+    "Circuit breaker trip events.",
+    ["service"],
+)
+
+CIRCUIT_BREAKER_STATE = Gauge(
+    "hermes_circuit_breaker_state",
+    "Circuit breaker current state (0=closed, 1=open).",
+    ["service"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+ESCALATIONS_SENT = Counter(
+    "hermes_escalations_sent_total",
+    "Escalation events dispatched, by target and result.",
+    ["alert_type", "target", "result"],
+)
+
+SLACK_NOTIFICATIONS = Counter(
+    "hermes_slack_notifications_total",
+    "Slack notification attempts.",
+    ["type", "status"],
+)
+
+JIRA_OPERATIONS = Counter(
+    "hermes_jira_operations_total",
+    "JIRA write/read operations issued by Hermes.",
+    ["operation", "status"],
+)
+
+JIRA_TICKET_FETCH = Counter(
+    "hermes_jira_ticket_fetch_total",
+    "JIRA ticket lookup attempts (legacy, kept for dashboard back-compat).",
+    ["alert_type", "status"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Build / config metadata
+# ---------------------------------------------------------------------------
+BUILD_INFO = Gauge(
+    "hermes_build_info",
+    "Build/config metadata. The value is always 1; use the labels.",
+    ["version", "commit", "config_hash"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _classify_error(exc: BaseException) -> str:
+    """Map an exception to a bounded label value (the class name, truncated)."""
+    return type(exc).__name__[:64] or "Unknown"
+
+
+@contextlib.asynccontextmanager
+async def track_call(service: str, operation: str) -> AsyncIterator[None]:
+    """
+    Async context manager that records latency and error metrics around an
+    external service call.
+
+    ``service`` and ``operation`` MUST come from a closed set (see
+    ``ExternalService`` and the per-client constants). Any caller wrapping a
+    user-controlled string here will blow up Prometheus cardinality.
+    """
+    start = time.monotonic()
+    status = "success"
+    try:
+        yield
+    except BaseException as exc:
+        status = "error"
+        EXTERNAL_CALL_ERRORS.labels(
+            service=service,
+            operation=operation,
+            error_type=_classify_error(exc),
+        ).inc()
+        raise
+    finally:
+        EXTERNAL_CALL_DURATION.labels(
+            service=service,
+            operation=operation,
+            status=status,
+        ).observe(time.monotonic() - start)
+
+
+def set_circuit_breaker_state(service: str, is_open: bool) -> None:
+    CIRCUIT_BREAKER_STATE.labels(service=service).set(1 if is_open else 0)
+
+
+def init_circuit_breaker_states(services: Iterable[str]) -> None:
+    """Seed the gauge at 0 for known services so dashboards have a series."""
+    for service in services:
+        CIRCUIT_BREAKER_STATE.labels(service=service).set(0)
+
+
+def set_active_workflow_count(count: int) -> None:
+    ACTIVE_WORKFLOWS.set(count)
+
+
+def set_build_info(version: str, commit: str = "unknown", config_hash: str = "unknown") -> None:
+    """Set the build_info gauge to 1 with the given labels."""
+    BUILD_INFO.labels(version=version, commit=commit, config_hash=config_hash).set(1)
+
+
+def reset_for_tests(registry: Optional[CollectorRegistry] = None) -> None:
+    """
+    Helper used only by tests to clear collector state between cases. Prometheus
+    metrics are process-global; call this from a fixture if you need a clean
+    slate.
+    """
+    target = registry or REGISTRY
+    for collector in list(getattr(target, "_collector_to_names", {}).keys()):
+        if hasattr(collector, "_metrics"):
+            collector._metrics.clear()  # type: ignore[attr-defined]
+        if hasattr(collector, "_metric_init"):
+            try:
+                collector._metric_init()  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 - best-effort reset
+                pass
+
+
+# Public re-exports
+__all__ = [
+    "ACTIVE_WORKFLOWS",
+    "ALERT_RESOLUTION_WAIT",
+    "ALERTS_DEDUPLICATED",
+    "ALERTS_RECEIVED_BY_TYPE",
+    "BUILD_INFO",
+    "CIRCUIT_BREAKER_STATE",
+    "CIRCUIT_BREAKER_TRIPS",
+    "CONCURRENCY_LIMIT_HIT",
+    "ESCALATIONS_SENT",
+    "EXTERNAL_CALL_DURATION",
+    "EXTERNAL_CALL_ERRORS",
+    "ExternalService",
+    "INCOMING_REQUESTS",
+    "JIRA_OPERATIONS",
+    "JIRA_TICKET_FETCH",
+    "JOB_EXECUTION_DURATION",
+    "PROCESSING_DURATION",
+    "PROCESSING_ERRORS",
+    "RATE_LIMITED_REQUESTS",
+    "REMEDIATION_DURATION",
+    "REMEDIATION_OUTCOMES",
+    "REMEDIATION_RETRIES",
+    "REMEDIATION_WORKFLOWS",
+    "RESOLUTION_SOURCE",
+    "RUNDECK_JOB_TRIGGERS",
+    "RemediationOutcome",
+    "ResolutionSource",
+    "SLACK_NOTIFICATIONS",
+    "WORKFLOW_RECOVERY",
+    "init_circuit_breaker_states",
+    "reset_for_tests",
+    "set_active_workflow_count",
+    "set_build_info",
+    "set_circuit_breaker_state",
+    "track_call",
+]

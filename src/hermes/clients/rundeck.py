@@ -8,6 +8,8 @@ import logging
 from typing import Optional, Dict, Any
 import httpx
 
+from hermes.utils.metrics import ExternalService, track_call
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,31 +60,32 @@ class RundeckClient:
         
         logger.info("Authenticating with Rundeck using username/password...")
         
-        async with httpx.AsyncClient(verify=self.verify_ssl, timeout=self.timeout) as client:
-            try:
-                response = await client.post(
-                    f"{self.base_url}/j_security_check",
-                    data={
-                        "j_username": self.username,
-                        "j_password": self.password
-                    },
-                    follow_redirects=True
-                )
-                
-                # Extract JSESSIONID cookie from response cookies
-                # Check both response cookies and client cookies
-                self._session_cookie = response.cookies.get("JSESSIONID") or client.cookies.get("JSESSIONID")
-                
-                if self._session_cookie:
-                    logger.info(f"Successfully authenticated with Rundeck (session: {self._session_cookie[:8]}...)")
-                    return True
-                else:
-                    logger.error("Failed to obtain session cookie from Rundeck")
-                    return False
+        async with track_call(ExternalService.RUNDECK, "login"):
+            async with httpx.AsyncClient(verify=self.verify_ssl, timeout=self.timeout) as client:
+                try:
+                    response = await client.post(
+                        f"{self.base_url}/j_security_check",
+                        data={
+                            "j_username": self.username,
+                            "j_password": self.password
+                        },
+                        follow_redirects=True
+                    )
                     
-            except httpx.HTTPError as e:
-                logger.error(f"Failed to authenticate with Rundeck: {e}")
-                return False
+                    # Extract JSESSIONID cookie from response cookies
+                    # Check both response cookies and client cookies
+                    self._session_cookie = response.cookies.get("JSESSIONID") or client.cookies.get("JSESSIONID")
+                    
+                    if self._session_cookie:
+                        logger.info(f"Successfully authenticated with Rundeck (session: {self._session_cookie[:8]}...)")
+                        return True
+                    else:
+                        logger.error("Failed to obtain session cookie from Rundeck")
+                        return False
+                        
+                except httpx.HTTPError as e:
+                    logger.error(f"Failed to authenticate with Rundeck: {e}")
+                    return False
     
     def _get_headers(self) -> Dict[str, str]:
         """Get headers for API requests."""
@@ -169,11 +172,12 @@ class RundeckClient:
         Returns:
             Execution details including 'id' and 'permalink'
         """
-        return await self._request(
-            method="POST",
-            endpoint=f"/job/{job_id}/run",
-            json_data={"options": options}
-        )
+        async with track_call(ExternalService.RUNDECK, "run_job"):
+            return await self._request(
+                method="POST",
+                endpoint=f"/job/{job_id}/run",
+                json_data={"options": options}
+            )
     
     async def get_execution(self, execution_id: str) -> Dict[str, Any]:
         """
@@ -185,10 +189,11 @@ class RundeckClient:
         Returns:
             Execution details including 'status'
         """
-        return await self._request(
-            method="GET",
-            endpoint=f"/execution/{execution_id}"
-        )
+        async with track_call(ExternalService.RUNDECK, "get_execution"):
+            return await self._request(
+                method="GET",
+                endpoint=f"/execution/{execution_id}"
+            )
     
     async def get_execution_output(self, execution_id: str) -> Dict[str, Any]:
         """
@@ -200,7 +205,8 @@ class RundeckClient:
         Returns:
             Execution output
         """
-        return await self._request(
-            method="GET",
-            endpoint=f"/execution/{execution_id}/output"
-        )
+        async with track_call(ExternalService.RUNDECK, "get_execution_output"):
+            return await self._request(
+                method="GET",
+                endpoint=f"/execution/{execution_id}/output"
+            )
