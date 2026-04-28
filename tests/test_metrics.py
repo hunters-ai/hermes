@@ -1,4 +1,5 @@
 """Tests for Prometheus metrics."""
+import asyncio
 import os
 from unittest.mock import MagicMock
 
@@ -321,6 +322,75 @@ class TestTrackCall:
             error_type="ValueError",
         )
         assert after == before + 1
+
+    @pytest.mark.asyncio
+    async def test_track_call_does_not_record_cancellation(self):
+        """
+        ``asyncio.CancelledError`` is a control-flow signal raised when
+        ``RemediationManager.shutdown`` cancels in-flight workflow tasks.
+        It must propagate untouched: no error counter, no latency
+        observation. Otherwise every graceful shutdown would spike
+        ``hermes_external_call_errors_total{error_type="CancelledError"}``.
+        """
+        err_before = _counter_value(
+            m.EXTERNAL_CALL_ERRORS,
+            service="rundeck",
+            operation="unit_test_cancel",
+            error_type="CancelledError",
+        )
+        success_sum_before = m.EXTERNAL_CALL_DURATION.labels(
+            service="rundeck", operation="unit_test_cancel", status="success"
+        )._sum.get()  # type: ignore[attr-defined]
+        error_sum_before = m.EXTERNAL_CALL_DURATION.labels(
+            service="rundeck", operation="unit_test_cancel", status="error"
+        )._sum.get()  # type: ignore[attr-defined]
+
+        with pytest.raises(asyncio.CancelledError):
+            async with m.track_call("rundeck", "unit_test_cancel"):
+                raise asyncio.CancelledError()
+
+        err_after = _counter_value(
+            m.EXTERNAL_CALL_ERRORS,
+            service="rundeck",
+            operation="unit_test_cancel",
+            error_type="CancelledError",
+        )
+        success_sum_after = m.EXTERNAL_CALL_DURATION.labels(
+            service="rundeck", operation="unit_test_cancel", status="success"
+        )._sum.get()  # type: ignore[attr-defined]
+        error_sum_after = m.EXTERNAL_CALL_DURATION.labels(
+            service="rundeck", operation="unit_test_cancel", status="error"
+        )._sum.get()  # type: ignore[attr-defined]
+
+        assert err_after == err_before
+        assert success_sum_after == success_sum_before
+        assert error_sum_after == error_sum_before
+
+    @pytest.mark.asyncio
+    async def test_track_call_does_not_record_keyboard_interrupt(self):
+        """
+        Other ``BaseException`` (``KeyboardInterrupt``, ``SystemExit``,
+        ``GeneratorExit``) are interpreter shutdown / generator-cleanup
+        signals. They must propagate untouched, same as cancellation.
+        """
+        err_before = _counter_value(
+            m.EXTERNAL_CALL_ERRORS,
+            service="rundeck",
+            operation="unit_test_kbd",
+            error_type="KeyboardInterrupt",
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            async with m.track_call("rundeck", "unit_test_kbd"):
+                raise KeyboardInterrupt()
+
+        err_after = _counter_value(
+            m.EXTERNAL_CALL_ERRORS,
+            service="rundeck",
+            operation="unit_test_kbd",
+            error_type="KeyboardInterrupt",
+        )
+        assert err_after == err_before
 
 
 class TestClassifyDedupReason:

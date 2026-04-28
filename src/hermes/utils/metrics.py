@@ -20,6 +20,7 @@ Never use raw exception messages or user-controlled strings as label values.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import time
@@ -268,24 +269,42 @@ async def track_call(service: str, operation: str) -> AsyncIterator[None]:
     ``service`` and ``operation`` MUST come from a closed set (see
     ``ExternalService`` and the per-client constants). Any caller wrapping a
     user-controlled string here will blow up Prometheus cardinality.
+
+    Exception handling:
+
+    - ``Exception`` subclasses → recorded as a service error: increments
+      ``EXTERNAL_CALL_ERRORS`` and observes latency with ``status="error"``.
+    - ``asyncio.CancelledError`` → propagated untouched. Cancellation is a
+      control-flow signal (e.g. ``RemediationManager.shutdown`` calls
+      ``task.cancel()`` on every in-flight workflow), not a dependency
+      failure. Recording it would spike ``hermes_external_call_errors_total``
+      on every graceful shutdown / deploy.
+    - Other ``BaseException`` (``KeyboardInterrupt``, ``SystemExit``,
+      ``GeneratorExit``) → also propagated untouched. They are interpreter
+      shutdown / generator-cleanup signals, not service errors.
     """
     start = time.monotonic()
-    status = "success"
     try:
         yield
-    except BaseException as exc:
-        status = "error"
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - intentionally broad, see docstring
         EXTERNAL_CALL_ERRORS.labels(
             service=service,
             operation=operation,
             error_type=_classify_error(exc),
         ).inc()
-        raise
-    finally:
         EXTERNAL_CALL_DURATION.labels(
             service=service,
             operation=operation,
-            status=status,
+            status="error",
+        ).observe(time.monotonic() - start)
+        raise
+    else:
+        EXTERNAL_CALL_DURATION.labels(
+            service=service,
+            operation=operation,
+            status="success",
         ).observe(time.monotonic() - start)
 
 
