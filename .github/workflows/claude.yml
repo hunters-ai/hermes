@@ -1,0 +1,111 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        with:
+          role-to-assume: arn:aws:iam::685648138888:role/hunters-us-west-2-github-actions-claude-review
+          aws-region: us-west-2
+
+      - uses: anthropics/claude-code-action@491e5eb471f4008dc0db76dfec54c56ff9f88bba # v1.0.70
+        with:
+          use_bedrock: "true"
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: |
+            Review the changes in this PR for bugs, security issues, and correctness.
+            Use git diff to see the changed files and explore the codebase as needed.
+            Be concise. Output your review as plain text.
+          claude_args: "--model us.anthropic.claude-sonnet-4-6 --max-turns 20 --allowedTools Bash"
+
+      - name: Post review comment
+        if: always()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            const fs = require('fs');
+            const MARKER = '<!-- claude-code-review -->';
+            const logFile = '/home/runner/work/_temp/claude-execution-output.json';
+            if (!fs.existsSync(logFile)) {
+              core.warning('Claude execution log not found.');
+              return;
+            }
+            const log = JSON.parse(fs.readFileSync(logFile, 'utf8'));
+            const assistantMessages = log.filter(e => e.type === 'assistant' && e.message?.content);
+            const lastMsg = assistantMessages[assistantMessages.length - 1];
+            if (!lastMsg) {
+              core.warning('No assistant messages found in Claude execution log.');
+              return;
+            }
+            const text = lastMsg.message.content
+              .filter(c => c.type === 'text')
+              .map(c => c.text)
+              .join('\n');
+            if (!text.trim()) return;
+            const body = `${MARKER}\n## Claude Code Review\n\n${text}`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body?.includes(MARKER));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  claude-help:
+    if: >
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        with:
+          role-to-assume: arn:aws:iam::685648138888:role/hunters-us-west-2-github-actions-claude-review
+          aws-region: us-west-2
+
+      - uses: anthropics/claude-code-action@491e5eb471f4008dc0db76dfec54c56ff9f88bba # v1.0.70
+        with:
+          use_bedrock: "true"
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          claude_args: "--model us.anthropic.claude-opus-4-6-v1 --max-turns 30 --allowedTools Bash"
