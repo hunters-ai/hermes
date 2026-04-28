@@ -137,6 +137,21 @@ class TestOutcomeRecording:
         # No exception should escape.
         manager._record_outcome("UnitTestAlert", "success", attempts=1)
 
+    def test_record_outcome_requires_attempts(self):
+        """
+        ``attempts`` is required and must be an ``int``. A defensive ``None``
+        / ``"unknown"`` fallback would create a confusing hole in attempts
+        distribution charts (``attempts="0"`` doesn't mean "zero attempts",
+        it would silently mean "we forgot to pass the value"). The single
+        in-tree caller (:meth:`_record_terminal`) already substitutes ``1``
+        when ``workflow.attempts`` is missing, so passing ``None`` here is a
+        programming error and should fail loudly.
+        """
+        manager = _make_manager()
+
+        with pytest.raises(TypeError):
+            manager._record_outcome("UnitTestAlert", "success")  # type: ignore[call-arg]
+
 
 class TestTerminalRecording:
     def test_terminal_records_outcome_and_duration(self):

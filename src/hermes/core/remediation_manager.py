@@ -274,15 +274,22 @@ class RemediationManager:
         self,
         alert_name: str,
         outcome: str,
-        attempts: Optional[int] = None,
+        attempts: int,
     ) -> None:
-        """Record remediation outcome metric (closed-set ``outcome``)."""
-        attempt_label = str(attempts) if attempts is not None else "0"
+        """
+        Record remediation outcome metric (closed-set ``outcome``).
+
+        ``attempts`` is required and must be an ``int``: the only caller
+        (:meth:`_record_terminal`) substitutes ``1`` for a missing
+        ``workflow.attempts``, so there is no legitimate path that needs an
+        ``"unknown"`` / ``"0"`` placeholder. Keeping the value monotonic and
+        meaningful avoids a confusing hole in attempts-distribution charts.
+        """
         try:
             metrics.REMEDIATION_OUTCOMES.labels(
                 alert_type=alert_name,
                 outcome=outcome,
-                attempts=attempt_label,
+                attempts=str(attempts),
             ).inc()
         except Exception as e:  # noqa: BLE001 - metrics never break workflows
             logger.warning(f"Failed to record outcome metric: {e}")
