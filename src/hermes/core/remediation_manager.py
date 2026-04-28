@@ -12,7 +12,7 @@ This is the core orchestration component that:
 import asyncio
 import logging
 import uuid
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Set, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 
@@ -147,6 +147,13 @@ class RemediationManager:
         self._running_tasks: Dict[str, asyncio.Task] = {}
         # Track resolution events for early termination via webhook
         self._resolution_events: Dict[str, asyncio.Event] = {}
+        # Workflow ids that already had a terminal outcome / duration recorded.
+        # Used to keep ``_record_terminal`` idempotent so that an exception in
+        # ``_escalate`` (or any post-record step) doesn't cause the outer
+        # exception handler in ``_monitor_workflow`` to record a *second*
+        # terminal sample with ``outcome="escalated"``. Cleared in the
+        # ``finally`` block of ``_monitor_workflow`` / ``_resume_workflow``.
+        self._terminal_recorded: Set[str] = set()
         
         # Circuit breakers for external services
         self._circuit_breakers: Dict[str, CircuitBreakerState] = {
@@ -285,7 +292,19 @@ class RemediationManager:
         """
         Record metrics emitted exactly once per workflow at terminal time:
         the outcome counter and the end-to-end duration histogram.
+
+        Idempotent: subsequent calls for the same ``workflow.id`` are no-ops.
+        This protects against double-counting when an inner handler records
+        the real outcome (e.g. ``retrigger_failed``) and a follow-up step
+        (typically ``_escalate``) raises, causing the outer exception handler
+        in ``_monitor_workflow`` to attempt a second ``escalated`` recording.
         """
+        if workflow.id in self._terminal_recorded:
+            logger.debug(
+                f"Terminal metrics already recorded for workflow {workflow.id}, "
+                f"skipping outcome={outcome}"
+            )
+            return
         attempts = workflow.attempts or 1
         self._record_outcome(workflow.alert_name, outcome, attempts=attempts)
         try:
@@ -296,6 +315,7 @@ class RemediationManager:
             ).observe(duration)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Failed to record remediation duration: {e}")
+        self._terminal_recorded.add(workflow.id)
     
     def _refresh_active_workflows_gauge(self) -> None:
         metrics.set_active_workflow_count(len(self._running_tasks))
@@ -430,10 +450,13 @@ class RemediationManager:
             if workflow:
                 workflow.update_state(RemediationState.ESCALATED, str(e))
                 await self.state_store.save(workflow)
+                # No-op if an inner handler already recorded a more specific
+                # terminal outcome before the exception was raised.
                 self._record_terminal(workflow, RemediationOutcome.ESCALATED)
         finally:
             self._running_tasks.pop(workflow_id, None)
             self._resolution_events.pop(workflow_id, None)
+            self._terminal_recorded.discard(workflow_id)
             self._refresh_active_workflows_gauge()
     
     async def _wait_for_alert_resolution(
@@ -960,10 +983,13 @@ class RemediationManager:
             logger.exception(f"Error in recovered workflow {workflow.id}: {e}")
             workflow.update_state(RemediationState.ESCALATED, str(e))
             await self.state_store.save(workflow)
+            # No-op if an inner handler already recorded a more specific
+            # terminal outcome before the exception was raised.
             self._record_terminal(workflow, RemediationOutcome.ESCALATED)
         finally:
             self._running_tasks.pop(workflow.id, None)
             self._resolution_events.pop(workflow.id, None)
+            self._terminal_recorded.discard(workflow.id)
             self._refresh_active_workflows_gauge()
     
     async def shutdown(self) -> None:

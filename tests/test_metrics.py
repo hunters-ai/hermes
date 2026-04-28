@@ -173,6 +173,99 @@ class TestTerminalRecording:
         assert after == before + 1
         assert hist_after >= hist_before  # duration sum monotonically grows
 
+    def test_terminal_is_idempotent_per_workflow(self):
+        """
+        Once a workflow has a terminal outcome recorded, a follow-up call
+        (e.g. from the outer ``_monitor_workflow`` exception handler after
+        ``_escalate`` raises) must not contribute a second sample to
+        ``hermes_remediation_outcomes_total`` or
+        ``hermes_remediation_duration_seconds``.
+        """
+        manager = _make_manager()
+        wf = RemediationWorkflow(
+            id="wf-idem",
+            alert_name="IdemAlert",
+            alert_labels={},
+            state=RemediationState.JOB_TRIGGERED,
+            attempts=1,
+        )
+
+        primary_before = _counter_value(
+            m.REMEDIATION_OUTCOMES,
+            alert_type="IdemAlert",
+            outcome="retrigger_failed",
+            attempts="1",
+        )
+        escalated_before = _counter_value(
+            m.REMEDIATION_OUTCOMES,
+            alert_type="IdemAlert",
+            outcome="escalated",
+            attempts="1",
+        )
+        # The escalated-labelled histogram series must stay flat — a second
+        # _record_terminal call would add an observation to it.
+        escalated_hist_sum_before = m.REMEDIATION_DURATION.labels(
+            alert_type="IdemAlert", outcome="escalated"
+        )._sum.get()  # type: ignore[attr-defined]
+
+        manager._record_terminal(wf, "retrigger_failed")
+        # Simulates the outer handler firing after _escalate raised.
+        manager._record_terminal(wf, "escalated")
+
+        primary_after = _counter_value(
+            m.REMEDIATION_OUTCOMES,
+            alert_type="IdemAlert",
+            outcome="retrigger_failed",
+            attempts="1",
+        )
+        escalated_after = _counter_value(
+            m.REMEDIATION_OUTCOMES,
+            alert_type="IdemAlert",
+            outcome="escalated",
+            attempts="1",
+        )
+        escalated_hist_sum_after = m.REMEDIATION_DURATION.labels(
+            alert_type="IdemAlert", outcome="escalated"
+        )._sum.get()  # type: ignore[attr-defined]
+
+        assert primary_after == primary_before + 1
+        assert escalated_after == escalated_before  # second call was a no-op
+        assert escalated_hist_sum_after == escalated_hist_sum_before
+
+    def test_terminal_can_record_again_after_cleanup(self):
+        """
+        The idempotency sentinel is cleared in the monitor task's ``finally``
+        block via ``self._terminal_recorded.discard``. After cleanup, the
+        same workflow id (e.g. a recovered workflow on restart) must be
+        recordable again.
+        """
+        manager = _make_manager()
+        wf = RemediationWorkflow(
+            id="wf-cleanup",
+            alert_name="CleanupAlert",
+            alert_labels={},
+            state=RemediationState.JOB_TRIGGERED,
+            attempts=1,
+        )
+
+        manager._record_terminal(wf, "success")
+        manager._terminal_recorded.discard(wf.id)
+
+        before = _counter_value(
+            m.REMEDIATION_OUTCOMES,
+            alert_type="CleanupAlert",
+            outcome="escalated",
+            attempts="1",
+        )
+        manager._record_terminal(wf, "escalated")
+        after = _counter_value(
+            m.REMEDIATION_OUTCOMES,
+            alert_type="CleanupAlert",
+            outcome="escalated",
+            attempts="1",
+        )
+        assert after == before + 1
+
 
 class TestCircuitBreakerGauge:
     def test_gauge_flips_on_open_and_close(self):
