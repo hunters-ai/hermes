@@ -4,9 +4,22 @@ import asyncio
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, AsyncMock, patch
 
-from hermes.core.remediation_manager import RemediationManager
+from hermes.core.remediation_manager import RemediationManager, _WorkflowFallback
 from hermes.config import Config, RemediationConfig, AlertConfig, AlertRemediationConfig
 from hermes.core.state_store import InMemoryStateStore, RemediationWorkflow, RemediationState
+from hermes.utils import metrics as m
+
+
+def _outcomes_count(alert_type: str, outcome: str, attempts: str) -> float:
+    return m.REMEDIATION_OUTCOMES.labels(
+        alert_type=alert_type, outcome=outcome, attempts=attempts
+    )._value.get()  # type: ignore[attr-defined]
+
+
+def _duration_sum(alert_type: str, outcome: str) -> float:
+    return m.REMEDIATION_DURATION.labels(
+        alert_type=alert_type, outcome=outcome
+    )._sum.get()  # type: ignore[attr-defined]
 
 
 class TestWorkflowRecovery:
@@ -354,3 +367,313 @@ class TestResumeWorkflow:
         assert workflow.id not in manager._terminal_recorded
         # Fallback ESCALATED save was attempted (and raised, but was swallowed).
         assert RemediationState.ESCALATED in save_calls
+
+
+class TestWorkflowFallbackTerminal:
+    """The outer exception handler in ``_monitor_workflow`` falls back to
+    in-memory metadata (``_workflow_fallback``) when the state store is
+    unavailable. Without that fallback a Dynamo outage at the moment the
+    handler runs silently drops the terminal sample for the affected
+    workflow even though ``REMEDIATION_WORKFLOWS`` was already incremented
+    at start, so ``REMEDIATION_OUTCOMES`` permanently drifts low by one
+    and the started-vs-terminal invariant breaks. These tests pin that
+    contract.
+    """
+
+    @pytest.fixture
+    def mock_config(self):
+        config = MagicMock(spec=Config)
+        config.remediation = RemediationConfig(
+            poll_interval_seconds=1,
+            resolution_wait_minutes=1,
+            max_job_wait_minutes=1,
+        )
+        config.alertmanager = None
+        config.jira = None
+        config.slack = None
+        config.get_alert_config.return_value = MagicMock(
+            remediation=AlertRemediationConfig()
+        )
+        return config
+
+    @pytest.fixture
+    def state_store(self):
+        return InMemoryStateStore()
+
+    @pytest.fixture
+    def mock_rundeck_client(self):
+        return MagicMock()
+
+    @pytest.mark.asyncio
+    async def test_fallback_records_terminal_when_state_store_get_raises(
+        self, mock_config, state_store, mock_rundeck_client
+    ):
+        """``state_store.get`` raises in the outer handler — terminal still emitted.
+
+        This is the primary regression. Pre-fix, ``workflow`` stayed
+        ``None``, the ``if workflow:`` block was skipped, no terminal
+        metric was recorded, and the slot in ``_running_tasks`` was
+        released anyway — so ``REMEDIATION_OUTCOMES`` was permanently
+        short by one sample for this workflow.
+        """
+        workflow = RemediationWorkflow(
+            id="wf-store-down",
+            alert_name="WorkflowFallbackAlert",
+            alert_labels={},
+            state=RemediationState.JOB_TRIGGERED,
+            attempts=2,
+        )
+        await state_store.save(workflow)
+
+        manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
+
+        # Pre-register the fallback the way ``start_remediation`` /
+        # ``recover_active_workflows`` would have done before kicking off
+        # the monitor task.
+        manager._workflow_fallback[workflow.id] = _WorkflowFallback(
+            alert_name=workflow.alert_name,
+            created_at=workflow.created_at,
+            attempts=workflow.attempts,
+        )
+
+        outcome_before = _outcomes_count(
+            workflow.alert_name, "escalated", str(workflow.attempts)
+        )
+        duration_before = _duration_sum(workflow.alert_name, "escalated")
+
+        # Inner monitor blows up on its first iteration.
+        async def _raise(*_a, **_kw):
+            raise RuntimeError("inner monitor exploded")
+
+        manager._wait_for_job_completion = _raise
+
+        # Outer fallback ``state_store.get`` ALSO fails (Dynamo down).
+        async def _get_raises(_id):
+            raise RuntimeError("dynamo down during fallback get")
+
+        state_store.get = _get_raises  # type: ignore[assignment]
+
+        await manager._monitor_workflow(workflow.id)
+
+        outcome_after = _outcomes_count(
+            workflow.alert_name, "escalated", str(workflow.attempts)
+        )
+        duration_after = _duration_sum(workflow.alert_name, "escalated")
+
+        assert outcome_after == outcome_before + 1, (
+            "Terminal outcome MUST be recorded via fallback metadata when "
+            "state_store.get fails. If this fails, the started-vs-terminal "
+            "invariant is broken: REMEDIATION_WORKFLOWS got +1 at start but "
+            "REMEDIATION_OUTCOMES never got +1 to match."
+        )
+        assert duration_after >= duration_before, (
+            "REMEDIATION_DURATION must also observe the fallback sample, "
+            "otherwise the duration histogram is short by one observation "
+            "for every state-store-down crash."
+        )
+
+        # All cleanup still happens.
+        assert workflow.id not in manager._running_tasks
+        assert workflow.id not in manager._resolution_events
+        assert workflow.id not in manager._terminal_recorded
+        assert workflow.id not in manager._workflow_fallback
+
+    @pytest.mark.asyncio
+    async def test_fallback_records_terminal_when_state_store_get_returns_none(
+        self, mock_config, state_store, mock_rundeck_client
+    ):
+        """``state_store.get`` returns ``None`` inside the outer handler.
+
+        Same dead branch as the raise-during-get path: ``workflow``
+        stays ``None``, the regular ``if workflow:`` recording is
+        skipped, and pre-fix no terminal metric was recorded. Note this
+        test specifically exercises the *outer* handler — the inner
+        loop's own ``state_store.get -> None -> return`` early-exit is a
+        separate (milder) path that doesn't go through the fallback and
+        is not in scope here.
+        """
+        workflow = RemediationWorkflow(
+            id="wf-outer-none",
+            alert_name="WorkflowFallbackAlert",
+            alert_labels={},
+            state=RemediationState.JOB_TRIGGERED,
+            attempts=1,
+        )
+        await state_store.save(workflow)
+
+        manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
+        manager._workflow_fallback[workflow.id] = _WorkflowFallback(
+            alert_name=workflow.alert_name,
+            created_at=workflow.created_at,
+            attempts=workflow.attempts,
+        )
+
+        outcome_before = _outcomes_count(workflow.alert_name, "escalated", "1")
+
+        # Inner monitor blows up after the initial successful get.
+        async def _raise(*_a, **_kw):
+            raise RuntimeError("inner monitor exploded")
+
+        manager._wait_for_job_completion = _raise
+
+        # Inner loop's first ``state_store.get`` returns the workflow so
+        # the loop proceeds into ``_wait_for_job_completion`` (which
+        # raises). The OUTER handler's subsequent ``state_store.get``
+        # returns ``None`` (row deleted / eventually-consistent miss /
+        # clock skew), exercising the dead branch the fallback covers.
+        original_get = state_store.get
+        get_calls = {"n": 0}
+
+        async def _get_first_then_none(wid):
+            get_calls["n"] += 1
+            if get_calls["n"] == 1:
+                return await original_get(wid)
+            return None
+
+        state_store.get = _get_first_then_none  # type: ignore[assignment]
+
+        await manager._monitor_workflow(workflow.id)
+
+        outcome_after = _outcomes_count(workflow.alert_name, "escalated", "1")
+        assert get_calls["n"] >= 2, (
+            "Test must drive the outer handler's state_store.get path; if "
+            "this fails the inner loop short-circuited and we're not "
+            "actually exercising the fallback."
+        )
+        assert outcome_after == outcome_before + 1
+        assert workflow.id not in manager._workflow_fallback
+
+    @pytest.mark.asyncio
+    async def test_fallback_is_idempotent_with_terminal_recorded_sentinel(
+        self, mock_config, state_store, mock_rundeck_client
+    ):
+        """If an inner handler already recorded a more specific outcome,
+        the fallback path must not record a second ``escalated`` sample.
+
+        Same idempotency contract as the regular ``_record_terminal``,
+        enforced by the shared ``_terminal_recorded`` sentinel.
+        """
+        manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
+        wf_id = "wf-idem"
+        manager._workflow_fallback[wf_id] = _WorkflowFallback(
+            alert_name="IdemAlert",
+            created_at=datetime.utcnow() - timedelta(seconds=42),
+            attempts=1,
+        )
+        manager._terminal_recorded.add(wf_id)
+
+        before = _outcomes_count("IdemAlert", "escalated", "1")
+
+        result = manager._record_terminal_from_fallback(wf_id, "escalated")
+
+        after = _outcomes_count("IdemAlert", "escalated", "1")
+        assert result is True, (
+            "Returning False would mislead the caller into logging "
+            "'no fallback metadata' even though the entry exists; the "
+            "skip path should still be 'success' from the caller's view."
+        )
+        assert after == before, "Idempotency violated: second sample emitted."
+
+    @pytest.mark.asyncio
+    async def test_fallback_returns_false_when_metadata_missing(
+        self, mock_config, state_store, mock_rundeck_client
+    ):
+        """No fallback entry → no recording, returns False so the caller
+        can log a programming-error diagnostic."""
+        manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
+        result = manager._record_terminal_from_fallback("never-registered", "escalated")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_fallback_attempts_synced_on_retrigger(
+        self, mock_config, state_store, mock_rundeck_client
+    ):
+        """``_handle_alert_still_firing`` must keep ``_workflow_fallback``
+        in sync with the persisted attempt count.
+
+        Without this, a state-store-down crash mid-retry would record
+        ``attempts="1"`` for a workflow that was actually on attempt N,
+        distorting the retry distribution histogram.
+        """
+        # Configure max_attempts > 1 so we hit the retrigger branch, and
+        # zero cooldown so the test does not actually sleep (the prod
+        # path uses ``asyncio.sleep`` for any positive cooldown).
+        mock_config.remediation = RemediationConfig(
+            poll_interval_seconds=1,
+            resolution_wait_minutes=1,
+            max_job_wait_minutes=1,
+            max_attempts=3,
+            job_retrigger_cooldown_minutes=0,
+        )
+        mock_config.get_alert_config.return_value = MagicMock(
+            remediation=AlertRemediationConfig(
+                max_attempts=3,
+                job_retrigger_cooldown_minutes=0,
+            ),
+            job_id="job-retry",
+        )
+
+        workflow = RemediationWorkflow(
+            id="wf-retry",
+            alert_name="RetryAlert",
+            alert_labels={},
+            state=RemediationState.WAITING_RESOLUTION,
+            rundeck_execution_id="exec-old",
+            rundeck_options={"foo": "bar"},
+            attempts=1,
+            last_triggered_at=datetime.utcnow() - timedelta(hours=1),
+        )
+        await state_store.save(workflow)
+
+        manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
+        manager._workflow_fallback[workflow.id] = _WorkflowFallback(
+            alert_name=workflow.alert_name,
+            created_at=workflow.created_at,
+            attempts=1,
+        )
+
+        manager.rundeck_client.run_job = AsyncMock(
+            return_value={"id": "exec-new", "permalink": "https://r/exec-new"}
+        )
+
+        retry_initiated = await manager._handle_alert_still_firing(workflow)
+
+        assert retry_initiated is True
+        assert workflow.attempts == 2
+        assert manager._workflow_fallback[workflow.id].attempts == 2, (
+            "Fallback attempt count drifted from workflow.attempts. A "
+            "state-store-down crash now would record the wrong attempts "
+            "label for this workflow."
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_remediation_registers_fallback(
+        self, mock_config, state_store, mock_rundeck_client
+    ):
+        """Pin the contract that every started workflow has a fallback
+        entry by the time the monitor task could plausibly raise."""
+        manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
+        # Don't actually run the monitor task; we only care that the
+        # fallback was registered before scheduling.
+        manager._monitor_workflow = AsyncMock()
+
+        workflow_id = await manager.start_remediation(
+            alert_name="StartAlert",
+            alert_labels={"cluster": "prod"},
+            rundeck_execution_id="exec-0",
+        )
+
+        try:
+            assert workflow_id in manager._workflow_fallback
+            fallback = manager._workflow_fallback[workflow_id]
+            assert fallback.alert_name == "StartAlert"
+            assert fallback.attempts == 1
+        finally:
+            # Avoid leaking the running task across tests.
+            task = manager._running_tasks.pop(workflow_id, None)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass

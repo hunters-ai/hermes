@@ -76,6 +76,32 @@ class AlertCooldown:
     workflow_id: str
 
 
+@dataclass
+class _WorkflowFallback:
+    """In-memory fallback metadata for terminal metric recording.
+
+    Populated when a monitor task is started (``start_remediation`` and the
+    recovery path in ``recover_active_workflows``) and refreshed on every
+    successful retrigger. It exists for one purpose: when the outer
+    exception handler in ``_monitor_workflow`` runs and the state store is
+    unavailable (so ``state_store.get`` raises or returns ``None``), this
+    dict still has enough information to emit ``REMEDIATION_OUTCOMES`` and
+    ``REMEDIATION_DURATION``. Without it the started-vs-terminal invariant
+    (every workflow incremented in ``REMEDIATION_WORKFLOWS`` should also
+    appear in ``REMEDIATION_OUTCOMES``) would silently drift low by one
+    sample for every state-store-down crash, even though the workflow's
+    slot in ``_running_tasks`` is correctly released.
+
+    All fields use the same closed-set semantics as the regular path:
+    ``alert_name`` is bounded by ``config.yaml``; ``attempts`` is bounded
+    by ``remediation.max_attempts``.
+    """
+
+    alert_name: str
+    created_at: datetime
+    attempts: int = 1
+
+
 class RemediationManager:
     """
     Orchestrates the full remediation workflow:
@@ -157,6 +183,14 @@ class RemediationManager:
         # terminal sample with ``outcome="escalated"``. Cleared in the
         # ``finally`` block of ``_monitor_workflow`` / ``_resume_workflow``.
         self._terminal_recorded: Set[str] = set()
+        # In-memory fallback metadata for every running workflow. See
+        # ``_WorkflowFallback`` for the rationale; the short version is that
+        # the outer exception handler in ``_monitor_workflow`` may run while
+        # the state store is unavailable, in which case we still need
+        # ``alert_name`` / ``created_at`` / ``attempts`` to emit a terminal
+        # metric and keep started-vs-terminal balanced. Populated on
+        # workflow start, refreshed on retrigger, dropped in ``finally``.
+        self._workflow_fallback: Dict[str, _WorkflowFallback] = {}
         
         # Circuit breakers for external services
         self._circuit_breakers: Dict[str, CircuitBreakerState] = {
@@ -309,23 +343,78 @@ class RemediationManager:
         (typically ``_escalate``) raises, causing the outer exception handler
         in ``_monitor_workflow`` to attempt a second ``escalated`` recording.
         """
-        if workflow.id in self._terminal_recorded:
+        self._record_terminal_metrics(
+            workflow_id=workflow.id,
+            alert_name=workflow.alert_name,
+            created_at=workflow.created_at,
+            attempts=workflow.attempts or 1,
+            outcome=outcome,
+        )
+
+    def _record_terminal_from_fallback(
+        self,
+        workflow_id: str,
+        outcome: str,
+    ) -> bool:
+        """Record terminal metrics using ``_workflow_fallback`` metadata.
+
+        Used by the outer exception handler in ``_monitor_workflow`` when
+        ``state_store.get`` raises or returns ``None`` and the regular
+        ``RemediationWorkflow``-based path is therefore unavailable. Without
+        this, a state-store outage at the moment the handler runs would
+        silently drop the terminal sample even though
+        ``REMEDIATION_WORKFLOWS`` was already incremented at start, breaking
+        the started-vs-terminal invariant.
+
+        Idempotent via the same ``_terminal_recorded`` sentinel as
+        :meth:`_record_terminal`. Returns ``True`` if a record was emitted
+        (or skipped because already recorded), ``False`` if no fallback
+        entry exists for ``workflow_id`` so the caller can log accordingly.
+        """
+        fallback = self._workflow_fallback.get(workflow_id)
+        if fallback is None:
+            return False
+        self._record_terminal_metrics(
+            workflow_id=workflow_id,
+            alert_name=fallback.alert_name,
+            created_at=fallback.created_at,
+            attempts=fallback.attempts,
+            outcome=outcome,
+        )
+        return True
+
+    def _record_terminal_metrics(
+        self,
+        *,
+        workflow_id: str,
+        alert_name: str,
+        created_at: datetime,
+        attempts: int,
+        outcome: str,
+    ) -> None:
+        """Idempotent terminal metric emission shared by both call paths.
+
+        Internal helper: callers should use :meth:`_record_terminal` (regular
+        path) or :meth:`_record_terminal_from_fallback` (state-store-down
+        path), which know how to source ``alert_name`` / ``created_at`` /
+        ``attempts`` and which arguments come from a closed set.
+        """
+        if workflow_id in self._terminal_recorded:
             logger.debug(
-                f"Terminal metrics already recorded for workflow {workflow.id}, "
+                f"Terminal metrics already recorded for workflow {workflow_id}, "
                 f"skipping outcome={outcome}"
             )
             return
-        attempts = workflow.attempts or 1
-        self._record_outcome(workflow.alert_name, outcome, attempts=attempts)
+        self._record_outcome(alert_name, outcome, attempts=attempts)
         try:
-            duration = (datetime.utcnow() - workflow.created_at).total_seconds()
+            duration = (datetime.utcnow() - created_at).total_seconds()
             metrics.REMEDIATION_DURATION.labels(
-                alert_type=workflow.alert_name,
+                alert_type=alert_name,
                 outcome=outcome,
             ).observe(duration)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Failed to record remediation duration: {e}")
-        self._terminal_recorded.add(workflow.id)
+        self._terminal_recorded.add(workflow_id)
     
     def _refresh_active_workflows_gauge(self) -> None:
         metrics.set_active_workflow_count(len(self._running_tasks))
@@ -371,14 +460,25 @@ class RemediationManager:
         
         await self.state_store.save(workflow)
         logger.info(f"Started remediation workflow {workflow_id} for alert {alert_name}")
-        
+
         # Record cooldown for this alert
         fingerprint = self._get_alert_fingerprint(alert_name, alert_labels)
         self._alert_cooldowns[fingerprint] = AlertCooldown(
             last_triggered=datetime.utcnow(),
             workflow_id=workflow_id
         )
-        
+
+        # Stash in-memory fallback metadata before kicking off the monitor
+        # task. If the monitor blows up while the state store is unreachable,
+        # the outer exception handler still has enough to emit a terminal
+        # metric and keep started-vs-terminal balanced. Cleared in the
+        # ``finally`` block of ``_monitor_workflow``.
+        self._workflow_fallback[workflow_id] = _WorkflowFallback(
+            alert_name=alert_name,
+            created_at=workflow.created_at,
+            attempts=workflow.attempts or 1,
+        )
+
         # Start background monitoring task
         task = asyncio.create_task(self._monitor_workflow(workflow_id))
         self._running_tasks[workflow_id] = task
@@ -483,10 +583,33 @@ class RemediationManager:
                 # No-op if an inner handler already recorded a more specific
                 # terminal outcome before the exception was raised.
                 self._record_terminal(workflow, RemediationOutcome.ESCALATED)
+            else:
+                # State store is unavailable (``get`` raised) or the row is
+                # gone (``get`` returned ``None``). We still need to emit a
+                # terminal sample so ``REMEDIATION_OUTCOMES`` stays balanced
+                # against ``REMEDIATION_WORKFLOWS`` — otherwise a Dynamo
+                # outage at the wrong moment silently drops one terminal
+                # observation per affected workflow even though the slot in
+                # ``_running_tasks`` is correctly released in ``finally``.
+                # The fallback is also idempotent against
+                # ``_terminal_recorded`` so it won't emit a duplicate when
+                # an inner handler already recorded a more specific outcome.
+                if not self._record_terminal_from_fallback(
+                    workflow_id, RemediationOutcome.ESCALATED
+                ):
+                    logger.error(
+                        f"No fallback metadata for workflow {workflow_id}; "
+                        f"terminal outcome metric will be missing for this "
+                        f"workflow. This indicates a programming error: every "
+                        f"workflow that enters ``_monitor_workflow`` should "
+                        f"have a ``_workflow_fallback`` entry registered "
+                        f"before its task is created."
+                    )
         finally:
             self._running_tasks.pop(workflow_id, None)
             self._resolution_events.pop(workflow_id, None)
             self._terminal_recorded.discard(workflow_id)
+            self._workflow_fallback.pop(workflow_id, None)
             self._refresh_active_workflows_gauge()
     
     async def _wait_for_alert_resolution(
@@ -801,6 +924,15 @@ class RemediationManager:
                 workflow.update_state(RemediationState.JOB_TRIGGERED)
                 await self.state_store.save(workflow)
 
+                # Keep the in-memory fallback in sync with the persisted
+                # attempt count. Without this, a state-store-down crash
+                # mid-retry would record ``attempts="1"`` for a workflow
+                # that was actually on attempt N, distorting the retry
+                # distribution histogram.
+                fallback = self._workflow_fallback.get(workflow.id)
+                if fallback is not None:
+                    fallback.attempts = new_attempt_number
+
                 logger.info(f"Retriggered remediation for workflow {workflow.id}, now attempts={workflow.attempts}")
                 return True
 
@@ -983,7 +1115,17 @@ class RemediationManager:
                     # Create resolution event
                     resolution_event = asyncio.Event()
                     self._resolution_events[workflow.id] = resolution_event
-                    
+
+                    # Stash fallback metadata for the outer exception handler
+                    # in ``_monitor_workflow`` (see ``_WorkflowFallback``).
+                    # Recovered workflows may already be on attempt N, so
+                    # carry that forward instead of resetting to 1.
+                    self._workflow_fallback[workflow.id] = _WorkflowFallback(
+                        alert_name=workflow.alert_name,
+                        created_at=workflow.created_at,
+                        attempts=workflow.attempts or 1,
+                    )
+
                     # Start monitoring task
                     task = asyncio.create_task(self._resume_workflow(workflow))
                     self._running_tasks[workflow.id] = task
