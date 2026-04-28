@@ -31,6 +31,7 @@ from hermes.utils.metrics import (
     ResolutionSource,
     SlackNotificationType,
     WorkflowRecoveryOutcome,
+    bucket_attempts,
 )
 
 
@@ -318,12 +319,19 @@ class RemediationManager:
         ``workflow.attempts``, so there is no legitimate path that needs an
         ``"unknown"`` / ``"0"`` placeholder. Keeping the value monotonic and
         meaningful avoids a confusing hole in attempts-distribution charts.
+
+        The integer is bucketed via :func:`bucket_attempts` before being
+        used as a label so the cardinality of ``REMEDIATION_OUTCOMES``
+        cannot blow up on a per-alert ``max_attempts`` override (the
+        config model has no upper bound). ``attempts="1"`` is preserved
+        exactly so the SLO dashboards' first-attempt success rate query
+        keeps working.
         """
         try:
             metrics.REMEDIATION_OUTCOMES.labels(
                 alert_type=alert_name,
                 outcome=outcome,
-                attempts=str(attempts),
+                attempts=bucket_attempts(attempts),
             ).inc()
         except Exception as e:  # noqa: BLE001 - metrics never break workflows
             logger.warning(f"Failed to record outcome metric: {e}")
@@ -907,7 +915,7 @@ class RemediationManager:
             new_attempt_number = (workflow.attempts or 0) + 1
             metrics.REMEDIATION_RETRIES.labels(
                 alert_type=workflow.alert_name,
-                attempt_number=str(new_attempt_number),
+                attempt_number=bucket_attempts(new_attempt_number),
             ).inc()
             
             try:

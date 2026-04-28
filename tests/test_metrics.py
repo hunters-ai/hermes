@@ -153,6 +153,117 @@ class TestOutcomeRecording:
         with pytest.raises(TypeError):
             manager._record_outcome("UnitTestAlert", "success")  # type: ignore[call-arg]
 
+    def test_record_outcome_buckets_high_attempt_count(self):
+        """A misconfigured per-alert ``max_attempts=100`` MUST NOT create
+        100 distinct ``attempts`` label series.
+
+        ``AlertRemediationConfig.max_attempts`` is an ``Optional[int]`` with
+        no upper bound in the config model — review can miss a
+        ``max_attempts: 50`` slipping into ``config.yaml`` for a single
+        flapping alert. Without bucketing, every distinct integer became
+        a new label series on ``REMEDIATION_OUTCOMES`` (and on
+        ``REMEDIATION_RETRIES``), and a Prometheus tsdb has no defense
+        against that — once those series exist they persist for the
+        retention window. This test pins that the call site goes through
+        :func:`bucket_attempts` so the same misconfiguration only ever
+        produces the ``"4+"`` bucket.
+        """
+        manager = _make_manager()
+        # ``42`` and ``99`` should both fold into the same ``"4+"`` series.
+        before = _counter_value(
+            m.REMEDIATION_OUTCOMES,
+            alert_type="BucketAlert",
+            outcome="success",
+            attempts="4+",
+        )
+
+        manager._record_outcome("BucketAlert", "success", attempts=42)
+        manager._record_outcome("BucketAlert", "success", attempts=99)
+
+        after = _counter_value(
+            m.REMEDIATION_OUTCOMES,
+            alert_type="BucketAlert",
+            outcome="success",
+            attempts="4+",
+        )
+        assert after == before + 2, (
+            "Both high-attempt observations should land in the '4+' bucket; "
+            "if this fails the call site is bypassing `bucket_attempts` and "
+            "we're back to unbounded cardinality on REMEDIATION_OUTCOMES."
+        )
+
+        # And confirm no per-integer series were created.
+        for n in (42, 99):
+            integer_series = _counter_value(
+                m.REMEDIATION_OUTCOMES,
+                alert_type="BucketAlert",
+                outcome="success",
+                attempts=str(n),
+            )
+            assert integer_series == 0.0, (
+                f"Unbounded series attempts={n!r} was created. "
+                f"`_record_outcome` must always pass through `bucket_attempts`."
+            )
+
+
+class TestAttemptBucket:
+    """Pin the boundary semantics of :func:`bucket_attempts` directly.
+
+    The helper is the single source of truth for the ``attempts`` /
+    ``attempt_number`` labels — ``REMEDIATION_OUTCOMES`` has it on every
+    sample, and ``REMEDIATION_RETRIES`` calls it from the retrigger path.
+    Both are unbounded without it (per-alert ``max_attempts`` overrides
+    have no cap in the config model). These tests pin the bucket
+    boundaries because the SLO recording rules and dashboards filter on
+    the resulting strings.
+    """
+
+    @pytest.mark.parametrize(
+        "attempts,expected",
+        [
+            # The dashboards rely on attempts="1" being the literal first
+            # attempt — preserved exactly.
+            (1, "1"),
+            (2, "2"),
+            (3, "3"),
+            # 4 is the first value to roll up; everything above it shares
+            # the same series so misconfigurations stay bounded.
+            (4, "4+"),
+            (5, "4+"),
+            (10, "4+"),
+            (100, "4+"),
+        ],
+    )
+    def test_bucket_returns_expected_value(self, attempts, expected):
+        assert m.bucket_attempts(attempts) == expected
+
+    @pytest.mark.parametrize("attempts", [0, -1, -100])
+    def test_bucket_clamps_non_positive_to_one(self, attempts):
+        """``0`` / negative values should never reach the metric (every
+        terminal workflow has run at least one attempt), but if they do,
+        clamp to ``"1"`` rather than producing a separate ``"0"`` /
+        ``"-1"`` series. Defensive against future callers that forget the
+        ``or 1`` guard."""
+        assert m.bucket_attempts(attempts) == "1"
+
+    def test_bucket_output_is_a_subset_of_attempt_bucket_constants(self):
+        """No matter what integer goes in, the output is one of the four
+        constants. This is what makes the label cardinality bounded by
+        construction."""
+        allowed = {
+            m.AttemptBucket.ONE,
+            m.AttemptBucket.TWO,
+            m.AttemptBucket.THREE,
+            m.AttemptBucket.FOUR_PLUS,
+        }
+        # Sweep a generous range including pathological values.
+        for n in [-5, 0, 1, 2, 3, 4, 5, 10, 100, 10_000]:
+            assert m.bucket_attempts(n) in allowed, (
+                f"bucket_attempts({n}) returned a value outside the closed "
+                f"AttemptBucket set; this would re-introduce unbounded "
+                f"cardinality on REMEDIATION_OUTCOMES / REMEDIATION_RETRIES."
+            )
+
 
 class TestTerminalRecording:
     def test_terminal_records_outcome_and_duration(self):
@@ -440,6 +551,19 @@ class TestClosedSetLabelEnums:
         assert m.WorkflowRecoveryOutcome.TERMINAL_SKIPPED == "terminal_skipped"
         assert m.WorkflowRecoveryOutcome.FAILED == "failed"
 
+    def test_attempt_bucket_constants(self):
+        """The closed set for the ``attempts`` / ``attempt_number`` labels.
+
+        These exact strings are part of the metric contract: the SLO
+        dashboards filter on ``attempts="1"`` for first-attempt success
+        rate, and recording rules / alerting rules have been authored
+        against this set. Renaming any of these breaks dashboards.
+        """
+        assert m.AttemptBucket.ONE == "1"
+        assert m.AttemptBucket.TWO == "2"
+        assert m.AttemptBucket.THREE == "3"
+        assert m.AttemptBucket.FOUR_PLUS == "4+"
+
     def test_call_sites_use_closed_set_label_values(self):
         """
         Source-level guard: the in-tree files that emit ``JIRA_OPERATIONS``,
@@ -478,13 +602,36 @@ class TestClosedSetLabelEnums:
                 r"outcome=(?:[\"'](?P<lit>[^\"']+)[\"']|WorkflowRecoveryOutcome\.[A-Z_]+)",
                 _allowed_values(m.WorkflowRecoveryOutcome),
             ),
+            # ``attempts`` / ``attempt_number`` MUST go through
+            # ``bucket_attempts(...)`` (or use an ``AttemptBucket.*`` constant
+            # / a literal already in the closed set) so that a per-alert
+            # ``max_attempts`` override can never blow up cardinality. A
+            # raw ``str(n)`` at a call site would silently re-introduce the
+            # unbounded behavior, so the regex below explicitly captures
+            # that case as the "literal" group and then validates against
+            # the closed set — ``str(...)`` is not a member, so it fails
+            # loudly.
+            (
+                repo_root / "src/hermes/core/remediation_manager.py",
+                "REMEDIATION_OUTCOMES",
+                r"attempts=(?:[\"'](?P<lit>[^\"']+)[\"']|bucket_attempts\([^)]+\)|AttemptBucket\.[A-Z_]+)",
+                _allowed_values(m.AttemptBucket),
+            ),
+            (
+                repo_root / "src/hermes/core/remediation_manager.py",
+                "REMEDIATION_RETRIES",
+                r"attempt_number=(?:[\"'](?P<lit>[^\"']+)[\"']|bucket_attempts\([^)]+\)|AttemptBucket\.[A-Z_]+)",
+                _allowed_values(m.AttemptBucket),
+            ),
         ]
 
         for path, scope, pattern, allowed in cases:
             text = path.read_text()
             blocks = _scope_blocks(text, scope) if scope else [text]
+            matched_any = False
             for block in blocks:
                 for match in re.finditer(pattern, block):
+                    matched_any = True
                     literal = match.group("lit")
                     if literal is None:
                         # Matched a constant-class reference; closed-set safe.
@@ -494,6 +641,24 @@ class TestClosedSetLabelEnums:
                         f"not a member of the closed set {sorted(allowed)!r}. "
                         f"Add it to the corresponding constant class or fix "
                         f"the typo at the call site."
+                    )
+            # Bucketing-related call sites: if the scope exists and contains
+            # the label kw at all, *something* should have matched. A
+            # mismatch (e.g. someone replacing ``bucket_attempts(...)`` with
+            # ``str(n)``) silently drops out of the union pattern instead of
+            # failing here, so spot-check by searching for the bare kw.
+            if scope in ("REMEDIATION_OUTCOMES", "REMEDIATION_RETRIES"):
+                kw = "attempts=" if scope == "REMEDIATION_OUTCOMES" else "attempt_number="
+                kw_present = any(kw in b for b in blocks)
+                if kw_present:
+                    assert matched_any, (
+                        f"{path.name}: a `.labels(..., {kw}...)` call on "
+                        f"{scope} did not match the allowed pattern. The "
+                        f"label MUST be one of: literal in {sorted(allowed)!r}, "
+                        f"`bucket_attempts(...)`, or `AttemptBucket.*`. "
+                        f"Anything else (notably `str(n)`) reintroduces the "
+                        f"unbounded-cardinality bug `bucket_attempts` exists "
+                        f"to prevent."
                     )
 
 

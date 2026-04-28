@@ -10,7 +10,13 @@ Label cardinality is kept bounded by:
 - ``outcome``: closed enum (see ``RemediationOutcome``).
 - ``service`` / ``operation``: closed enum (one entry per client method we
   care about).
-- ``attempts`` / ``attempt_number``: bounded by ``remediation.max_attempts``.
+- ``attempts`` / ``attempt_number``: bucketed via ``AttemptBucket`` /
+  ``bucket_attempts`` to a fixed closed set. ``remediation.max_attempts``
+  is a per-alert override with no upper bound in the config model, so
+  using ``str(attempts)`` directly would let a misconfiguration of e.g.
+  ``max_attempts=100`` produce 100 distinct label series per
+  (alert_type, outcome) pair. The bucketing keeps cardinality bounded
+  regardless of config values that slip through review.
 - ``endpoint``: closed set of FastAPI routes.
 - ``state``: ``RemediationState`` enum.
 - ``target`` / ``result`` / ``source`` / ``method`` / ``type`` / ``status`` /
@@ -98,6 +104,60 @@ class WorkflowRecoveryOutcome:
     FAILED = "failed"
 
 
+class AttemptBucket:
+    """Closed set of values for the ``attempts`` / ``attempt_number`` labels.
+
+    The default ``RemediationConfig.max_attempts`` is ``2`` and every
+    real-world value is in the low single digits, but
+    ``AlertRemediationConfig.max_attempts`` is a per-alert override with
+    no upper bound. Without bucketing, a misconfiguration of
+    ``max_attempts=100`` (or any value beyond a sane retry policy) would
+    create one new label series per integer, blowing up Prometheus
+    cardinality on :data:`REMEDIATION_OUTCOMES` and
+    :data:`REMEDIATION_RETRIES`.
+
+    These constants are the only legal label values. Use
+    :func:`bucket_attempts` at every call site instead of ``str(n)``.
+
+    Bucket choice: ``"1"`` is preserved exactly because the SLO dashboards
+    rely on a literal ``attempts="1"`` query for first-attempt success
+    rate. ``"2"`` and ``"3"`` keep integer precision in the regime that
+    matters operationally (the default policy maxes out at attempt 2).
+    Anything beyond gets folded into ``"4+"`` so the long tail / runaway
+    retries / misconfigurations are still visible as a single series
+    rather than vanishing or blowing up cardinality.
+    """
+
+    ONE = "1"
+    TWO = "2"
+    THREE = "3"
+    FOUR_PLUS = "4+"
+
+
+def bucket_attempts(attempts: int) -> str:
+    """Map an attempt count to its closed-set label value.
+
+    Single source of truth for the ``attempts`` (on
+    :data:`REMEDIATION_OUTCOMES`) and ``attempt_number`` (on
+    :data:`REMEDIATION_RETRIES`) labels — every call site MUST go through
+    this helper instead of ``str(n)``. See :class:`AttemptBucket` for the
+    rationale.
+
+    ``attempts`` is clamped to a minimum of ``1`` because the call sites
+    treat "no recorded attempt" the same as "attempt 1" (every workflow
+    has at least one job execution by the time it reaches a terminal
+    state). Negative values are also clamped to keep the label space
+    safe under unexpected inputs.
+    """
+    if attempts <= 1:
+        return AttemptBucket.ONE
+    if attempts == 2:
+        return AttemptBucket.TWO
+    if attempts == 3:
+        return AttemptBucket.THREE
+    return AttemptBucket.FOUR_PLUS
+
+
 # ---------------------------------------------------------------------------
 # HTTP layer
 # ---------------------------------------------------------------------------
@@ -161,15 +221,19 @@ REMEDIATION_WORKFLOWS = Counter(
 REMEDIATION_OUTCOMES = Counter(
     "hermes_remediation_outcomes_total",
     "Remediation outcomes by alert type, outcome, and number of attempts at "
-    "terminal time. ``attempts`` lets you compute first-attempt success rate "
-    "without a separate metric.",
+    "terminal time. ``attempts`` is bucketed via ``AttemptBucket`` "
+    "(``\"1\"``, ``\"2\"``, ``\"3\"``, ``\"4+\"``) so cardinality stays bounded "
+    "regardless of ``max_attempts`` config overrides; ``attempts=\"1\"`` "
+    "still gives you first-attempt success rate exactly.",
     ["alert_type", "outcome", "attempts"],
 )
 
 REMEDIATION_RETRIES = Counter(
     "hermes_remediation_retries_total",
     "Retry attempts initiated for a remediation workflow. ``attempt_number`` "
-    "is the new attempt number being started (e.g. ``2`` for the first retry).",
+    "is the new attempt number being started, bucketed via ``AttemptBucket`` "
+    "(``\"2\"``, ``\"3\"``, ``\"4+\"``) — note ``\"1\"`` is impossible here "
+    "because the first run is not a retry.",
     ["alert_type", "attempt_number"],
 )
 
@@ -391,6 +455,7 @@ __all__ = [
     "ALERT_RESOLUTION_WAIT",
     "ALERTS_DEDUPLICATED",
     "ALERTS_RECEIVED_BY_TYPE",
+    "AttemptBucket",
     "BUILD_INFO",
     "CIRCUIT_BREAKER_STATE",
     "CIRCUIT_BREAKER_TRIPS",
@@ -419,6 +484,7 @@ __all__ = [
     "SlackNotificationType",
     "WORKFLOW_RECOVERY",
     "WorkflowRecoveryOutcome",
+    "bucket_attempts",
     "init_circuit_breaker_states",
     "reset_for_tests",
     "set_active_workflow_count",
