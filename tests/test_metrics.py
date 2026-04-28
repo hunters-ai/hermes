@@ -393,6 +393,117 @@ class TestTrackCall:
         assert err_after == err_before
 
 
+class TestClosedSetLabelEnums:
+    """The module docstring promises ``operation`` / ``type`` / ``outcome``
+    labels come from a closed set. These tests pin the constant classes that
+    represent those sets and assert the in-tree call sites only emit values
+    from them — so a typo at a call site is caught here instead of silently
+    creating a new Prometheus series.
+    """
+
+    def test_jira_operation_constants(self):
+        assert m.JiraOperation.ADD_COMMENT == "add_comment"
+        assert m.JiraOperation.GET_TICKET == "get_ticket"
+        assert m.JiraOperation.SEARCH_TICKETS == "search_tickets"
+        assert (
+            m.JiraOperation.ADD_REMEDIATION_SUCCESS_COMMENT
+            == "add_remediation_success_comment"
+        )
+        assert (
+            m.JiraOperation.ADD_REMEDIATION_FAILURE_COMMENT
+            == "add_remediation_failure_comment"
+        )
+        assert m.JiraOperation.ADD_JOB_FAILURE_COMMENT == "add_job_failure_comment"
+
+    def test_slack_notification_type_constants(self):
+        assert m.SlackNotificationType.ESCALATION == "escalation"
+
+    def test_workflow_recovery_outcome_constants(self):
+        assert m.WorkflowRecoveryOutcome.RECOVERED == "recovered"
+        assert m.WorkflowRecoveryOutcome.STALE_SKIPPED == "stale_skipped"
+        assert m.WorkflowRecoveryOutcome.TERMINAL_SKIPPED == "terminal_skipped"
+        assert m.WorkflowRecoveryOutcome.FAILED == "failed"
+
+    def test_call_sites_use_closed_set_label_values(self):
+        """
+        Source-level guard: the in-tree files that emit ``JIRA_OPERATIONS``,
+        ``SLACK_NOTIFICATIONS`` and ``WORKFLOW_RECOVERY`` must not pass
+        unknown raw string literals to ``.labels(...)``. Catches typos like
+        ``"add_remediaton_success_comment"`` and any new free-form value
+        added without extending the constant class.
+        """
+        import re
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[1]
+
+        cases = [
+            (
+                repo_root / "src/hermes/core/remediation_manager.py",
+                "JIRA_OPERATIONS",
+                r"operation=(?:[\"'](?P<lit>[^\"']+)[\"']|JiraOperation\.[A-Z_]+|jira_op)",
+                _allowed_values(m.JiraOperation),
+            ),
+            (
+                repo_root / "src/hermes/clients/jira.py",
+                None,  # track_call call site, not JIRA_OPERATIONS
+                r"track_call\(ExternalService\.JIRA,\s*(?:[\"'](?P<lit>[^\"']+)[\"']|JiraOperation\.[A-Z_]+)",
+                _allowed_values(m.JiraOperation),
+            ),
+            (
+                repo_root / "src/hermes/core/remediation_manager.py",
+                "SLACK_NOTIFICATIONS",
+                r"type=(?:[\"'](?P<lit>[^\"']+)[\"']|SlackNotificationType\.[A-Z_]+)",
+                _allowed_values(m.SlackNotificationType),
+            ),
+            (
+                repo_root / "src/hermes/core/remediation_manager.py",
+                "WORKFLOW_RECOVERY",
+                r"outcome=(?:[\"'](?P<lit>[^\"']+)[\"']|WorkflowRecoveryOutcome\.[A-Z_]+)",
+                _allowed_values(m.WorkflowRecoveryOutcome),
+            ),
+        ]
+
+        for path, scope, pattern, allowed in cases:
+            text = path.read_text()
+            blocks = _scope_blocks(text, scope) if scope else [text]
+            for block in blocks:
+                for match in re.finditer(pattern, block):
+                    literal = match.group("lit")
+                    if literal is None:
+                        # Matched a constant-class reference; closed-set safe.
+                        continue
+                    assert literal in allowed, (
+                        f"{path.name}: raw string label value {literal!r} is "
+                        f"not a member of the closed set {sorted(allowed)!r}. "
+                        f"Add it to the corresponding constant class or fix "
+                        f"the typo at the call site."
+                    )
+
+
+def _allowed_values(cls) -> set:
+    return {
+        getattr(cls, name)
+        for name in vars(cls)
+        if not name.startswith("_") and isinstance(getattr(cls, name), str)
+    }
+
+
+def _scope_blocks(source: str, metric_name: str) -> list:
+    """Return the per-call-site text blocks for a given metric name.
+
+    We grab the line containing ``metric_name.labels(`` plus the next 3 lines
+    so we capture the kwargs even when the call is split across lines.
+    """
+    blocks: list = []
+    lines = source.splitlines()
+    needle = f"{metric_name}.labels("
+    for i, line in enumerate(lines):
+        if needle in line:
+            blocks.append("\n".join(lines[i : i + 4]))
+    return blocks
+
+
 class TestClassifyDedupReason:
     """Reasons returned by ``RemediationManager.check_deduplication``.
 

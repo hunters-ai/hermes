@@ -57,6 +57,47 @@ class ExternalService:
     DYNAMODB = "dynamodb"
 
 
+class JiraOperation:
+    """Closed set of Jira operation label values.
+
+    Used both as the ``operation`` label on :data:`JIRA_OPERATIONS` (recorded
+    by :class:`hermes.core.remediation_manager.RemediationManager`) and as
+    the ``operation`` label passed to :func:`track_call` from
+    :mod:`hermes.clients.jira` so the same Jira metric series stay aligned
+    across both layers.
+    """
+
+    # Low-level client methods (track_call).
+    ADD_COMMENT = "add_comment"
+    GET_TICKET = "get_ticket"
+    SEARCH_TICKETS = "search_tickets"
+
+    # High-level remediation operations (JIRA_OPERATIONS).
+    ADD_REMEDIATION_SUCCESS_COMMENT = "add_remediation_success_comment"
+    ADD_REMEDIATION_FAILURE_COMMENT = "add_remediation_failure_comment"
+    ADD_JOB_FAILURE_COMMENT = "add_job_failure_comment"
+
+
+class SlackNotificationType:
+    """Closed set of values for the ``type`` label on :data:`SLACK_NOTIFICATIONS`.
+
+    Add a new constant here whenever a new notification surface is added —
+    do not pass free-form strings at the call site or you'll silently create
+    a new label series.
+    """
+
+    ESCALATION = "escalation"
+
+
+class WorkflowRecoveryOutcome:
+    """Closed set of values for the ``outcome`` label on :data:`WORKFLOW_RECOVERY`."""
+
+    RECOVERED = "recovered"
+    STALE_SKIPPED = "stale_skipped"
+    TERMINAL_SKIPPED = "terminal_skipped"
+    FAILED = "failed"
+
+
 # ---------------------------------------------------------------------------
 # HTTP layer
 # ---------------------------------------------------------------------------
@@ -362,6 +403,7 @@ __all__ = [
     "JIRA_OPERATIONS",
     "JIRA_TICKET_FETCH",
     "JOB_EXECUTION_DURATION",
+    "JiraOperation",
     "PROCESSING_DURATION",
     "PROCESSING_ERRORS",
     "RATE_LIMITED_REQUESTS",
@@ -374,7 +416,9 @@ __all__ = [
     "RemediationOutcome",
     "ResolutionSource",
     "SLACK_NOTIFICATIONS",
+    "SlackNotificationType",
     "WORKFLOW_RECOVERY",
+    "WorkflowRecoveryOutcome",
     "init_circuit_breaker_states",
     "reset_for_tests",
     "set_active_workflow_count",

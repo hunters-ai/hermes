@@ -4,7 +4,7 @@ from typing import Optional, Dict, Any, List
 import httpx
 from base64 import b64encode
 
-from hermes.utils.metrics import ExternalService, track_call
+from hermes.utils.metrics import ExternalService, JiraOperation, track_call
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ class JiraClient:
         if visibility:
             body["visibility"] = visibility
         
-        async with track_call(ExternalService.JIRA, "add_comment"):
+        async with track_call(ExternalService.JIRA, JiraOperation.ADD_COMMENT):
             async with httpx.AsyncClient() as client:
                 try:
                     response = await client.post(url, headers=self._get_headers(), json=body)
@@ -133,7 +133,7 @@ class JiraClient:
         """Get ticket details."""
         url = f"{self.base_url}/rest/api/3/issue/{ticket_id}"
         
-        async with track_call(ExternalService.JIRA, "get_ticket"):
+        async with track_call(ExternalService.JIRA, JiraOperation.GET_TICKET):
             async with httpx.AsyncClient() as client:
                 try:
                     response = await client.get(url, headers=self._get_headers())
@@ -170,7 +170,7 @@ class JiraClient:
             "fields": fields or ["key", "summary", "created"]
         }
         
-        async with track_call(ExternalService.JIRA, "search_tickets"):
+        async with track_call(ExternalService.JIRA, JiraOperation.SEARCH_TICKETS):
             async with httpx.AsyncClient() as client:
                 try:
                     response = await client.post(url, headers=self._get_headers(), json=payload)

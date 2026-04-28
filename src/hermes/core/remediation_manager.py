@@ -26,8 +26,11 @@ from hermes.clients.slack import SlackClient
 from hermes.utils import metrics
 from hermes.utils.metrics import (
     ExternalService,
+    JiraOperation,
     RemediationOutcome,
     ResolutionSource,
+    SlackNotificationType,
+    WorkflowRecoveryOutcome,
 )
 
 
@@ -679,13 +682,13 @@ class RemediationManager:
                     workflow.rundeck_execution_url
                 )
                 metrics.JIRA_OPERATIONS.labels(
-                    operation="add_remediation_success_comment",
+                    operation=JiraOperation.ADD_REMEDIATION_SUCCESS_COMMENT,
                     status="success",
                 ).inc()
                 self.record_circuit_success(ExternalService.JIRA)
             except Exception as e:
                 metrics.JIRA_OPERATIONS.labels(
-                    operation="add_remediation_success_comment",
+                    operation=JiraOperation.ADD_REMEDIATION_SUCCESS_COMMENT,
                     status="error",
                 ).inc()
                 self.record_circuit_failure(ExternalService.JIRA)
@@ -804,9 +807,9 @@ class RemediationManager:
         # Add JIRA comment
         if self.jira_client and workflow.jira_ticket_id:
             jira_op = (
-                "add_job_failure_comment"
+                JiraOperation.ADD_JOB_FAILURE_COMMENT
                 if workflow.state == RemediationState.JOB_FAILED
-                else "add_remediation_failure_comment"
+                else JiraOperation.ADD_REMEDIATION_FAILURE_COMMENT
             )
             try:
                 if workflow.state == RemediationState.JOB_FAILED:
@@ -843,10 +846,14 @@ class RemediationManager:
                     jira_url=jira_url,
                     rundeck_url=workflow.rundeck_execution_url
                 )
-                metrics.SLACK_NOTIFICATIONS.labels(type="escalation", status="success").inc()
+                metrics.SLACK_NOTIFICATIONS.labels(
+                    type=SlackNotificationType.ESCALATION, status="success"
+                ).inc()
             except Exception as e:
                 slack_status = "failed"
-                metrics.SLACK_NOTIFICATIONS.labels(type="escalation", status="error").inc()
+                metrics.SLACK_NOTIFICATIONS.labels(
+                    type=SlackNotificationType.ESCALATION, status="error"
+                ).inc()
                 logger.error(f"Failed to send Slack escalation: {e}")
         
         metrics.ESCALATIONS_SENT.labels(
@@ -925,7 +932,9 @@ class RemediationManager:
                     logger.warning(f"Skipping stale workflow {workflow.id} (age: {age_hours:.1f}h)")
                     workflow.update_state(RemediationState.ESCALATED, "Workflow stale after restart")
                     await self.state_store.save(workflow)
-                    metrics.WORKFLOW_RECOVERY.labels(outcome="stale_skipped").inc()
+                    metrics.WORKFLOW_RECOVERY.labels(
+                        outcome=WorkflowRecoveryOutcome.STALE_SKIPPED
+                    ).inc()
                     continue
                 
                 # Re-populate cooldown tracking
@@ -952,17 +961,23 @@ class RemediationManager:
                     task = asyncio.create_task(self._resume_workflow(workflow))
                     self._running_tasks[workflow.id] = task
                     recovered += 1
-                    metrics.WORKFLOW_RECOVERY.labels(outcome="recovered").inc()
+                    metrics.WORKFLOW_RECOVERY.labels(
+                        outcome=WorkflowRecoveryOutcome.RECOVERED
+                    ).inc()
                 else:
                     logger.info(f"Workflow {workflow.id} in terminal state {workflow.state.value}, skipping recovery")
-                    metrics.WORKFLOW_RECOVERY.labels(outcome="terminal_skipped").inc()
+                    metrics.WORKFLOW_RECOVERY.labels(
+                        outcome=WorkflowRecoveryOutcome.TERMINAL_SKIPPED
+                    ).inc()
             
             self._refresh_active_workflows_gauge()
             return recovered
             
         except Exception as e:
             logger.error(f"Error recovering workflows: {e}")
-            metrics.WORKFLOW_RECOVERY.labels(outcome="failed").inc()
+            metrics.WORKFLOW_RECOVERY.labels(
+                outcome=WorkflowRecoveryOutcome.FAILED
+            ).inc()
             return recovered
     
     async def _resume_workflow(self, workflow: RemediationWorkflow) -> None:
