@@ -448,11 +448,31 @@ class RemediationManager:
         except asyncio.CancelledError:
             logger.info(f"Workflow {workflow_id} monitoring cancelled")
         except Exception as e:
+            # ``_monitor_workflow`` is the single fallback for unhandled
+            # exceptions in the workflow lifecycle. It MUST NOT itself
+            # propagate, because the task is fire-and-forget (created in
+            # ``start_remediation_workflow`` / ``recover_active_workflows``
+            # and never awaited at the call site) — propagation surfaces as
+            # noisy ``Task exception was never retrieved`` warnings and lets
+            # other layers attempt redundant cleanup.
             logger.exception(f"Error in workflow {workflow_id}: {e}")
-            workflow = await self.state_store.get(workflow_id)
+            workflow: Optional[RemediationWorkflow] = None
+            try:
+                workflow = await self.state_store.get(workflow_id)
+            except Exception as fetch_err:  # noqa: BLE001 - best-effort
+                logger.error(
+                    f"Failed to fetch workflow {workflow_id} during fallback "
+                    f"escalation: {fetch_err}"
+                )
             if workflow:
                 workflow.update_state(RemediationState.ESCALATED, str(e))
-                await self.state_store.save(workflow)
+                try:
+                    await self.state_store.save(workflow)
+                except Exception as save_err:  # noqa: BLE001 - best-effort
+                    logger.error(
+                        f"Failed to persist ESCALATED state for workflow "
+                        f"{workflow_id}: {save_err}"
+                    )
                 # No-op if an inner handler already recorded a more specific
                 # terminal outcome before the exception was raised.
                 self._record_terminal(workflow, RemediationOutcome.ESCALATED)
@@ -982,30 +1002,24 @@ class RemediationManager:
     
     async def _resume_workflow(self, workflow: RemediationWorkflow) -> None:
         """
-        Resume monitoring a recovered workflow based on its current state.
+        Resume monitoring a recovered workflow.
+
+        Thin wrapper around :meth:`_monitor_workflow`. ``_monitor_workflow``
+        owns the workflow's full lifecycle: it sets up the resolution event,
+        runs the monitor loop, and has a hardened outer ``try/except/finally``
+        that swallows cancellations, records the fallback ``escalated``
+        terminal metric (idempotently, see :meth:`_record_terminal`), and
+        cleans up ``_running_tasks`` / ``_resolution_events`` / the terminal
+        sentinel.
+
+        This wrapper deliberately does **not** repeat any of that. Earlier
+        revisions had their own ``except`` / ``finally`` here, but they were
+        either dead (``_monitor_workflow`` already handles every exception
+        without propagating) or actively buggy (the discarded
+        ``_terminal_recorded`` sentinel meant a re-entry through here would
+        record a second ``escalated`` sample for the same workflow).
         """
-        resolution_event = self._resolution_events.get(workflow.id)
-        if not resolution_event:
-            resolution_event = asyncio.Event()
-            self._resolution_events[workflow.id] = resolution_event
-            
-        try:
-            # _monitor_workflow already handles the polling loop end-to-end.
-            await self._monitor_workflow(workflow.id)
-        except asyncio.CancelledError:
-            logger.info(f"Recovered workflow {workflow.id} monitoring cancelled")
-        except Exception as e:
-            logger.exception(f"Error in recovered workflow {workflow.id}: {e}")
-            workflow.update_state(RemediationState.ESCALATED, str(e))
-            await self.state_store.save(workflow)
-            # No-op if an inner handler already recorded a more specific
-            # terminal outcome before the exception was raised.
-            self._record_terminal(workflow, RemediationOutcome.ESCALATED)
-        finally:
-            self._running_tasks.pop(workflow.id, None)
-            self._resolution_events.pop(workflow.id, None)
-            self._terminal_recorded.discard(workflow.id)
-            self._refresh_active_workflows_gauge()
+        await self._monitor_workflow(workflow.id)
     
     async def shutdown(self) -> None:
         """Cancel all running workflow monitors."""

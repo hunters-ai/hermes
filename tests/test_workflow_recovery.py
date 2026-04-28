@@ -278,3 +278,79 @@ class TestResumeWorkflow:
         
         manager._wait_for_alert_resolution.assert_called_once()
         manager._handle_success.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_workflow_is_thin_delegator(
+        self, mock_config, state_store, mock_rundeck_client
+    ):
+        """
+        ``_resume_workflow`` must just delegate to ``_monitor_workflow``.
+        ``_monitor_workflow`` owns the lifecycle (resolution event setup,
+        outcome recording, ``_running_tasks`` / ``_resolution_events`` /
+        terminal-sentinel cleanup); duplicating any of that here used to
+        cause a second ``escalated`` sample on certain failure paths.
+        """
+        workflow = RemediationWorkflow(
+            id="wf-delegator",
+            alert_name="TestAlert",
+            alert_labels={},
+            state=RemediationState.JOB_TRIGGERED,
+        )
+        manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
+        manager._monitor_workflow = AsyncMock()
+
+        await manager._resume_workflow(workflow)
+
+        manager._monitor_workflow.assert_awaited_once_with(workflow.id)
+
+    @pytest.mark.asyncio
+    async def test_monitor_workflow_outer_handler_swallows_fallback_save_failure(
+        self, mock_config, state_store, mock_rundeck_client
+    ):
+        """
+        The hardened outer ``except Exception`` in ``_monitor_workflow`` must
+        not propagate, even if the fallback ``state_store.save`` fails. If it
+        propagated, ``asyncio`` would log
+        ``Task exception was never retrieved`` and any caller awaiting the
+        coroutine (e.g. the previous ``_resume_workflow`` wrapper) would
+        attempt redundant cleanup and risk double-recording metrics.
+        """
+        workflow = RemediationWorkflow(
+            id="wf-fallback-fail",
+            alert_name="TestAlert",
+            alert_labels={},
+            state=RemediationState.JOB_TRIGGERED,
+        )
+        await state_store.save(workflow)
+
+        manager = RemediationManager(mock_config, state_store, mock_rundeck_client)
+
+        # Force the inner monitor loop to blow up on its first iteration.
+        async def _raise(*_args, **_kwargs):
+            raise RuntimeError("inner monitor exploded")
+
+        manager._wait_for_job_completion = _raise
+
+        # And make the fallback save inside the outer except handler ALSO
+        # fail — this is the path the previous redundant ``_resume_workflow``
+        # handler was trying (and failing) to protect against.
+        original_save = state_store.save
+        save_calls: list = []
+
+        async def _flaky_save(wf):
+            save_calls.append(wf.state)
+            if wf.state == RemediationState.ESCALATED:
+                raise RuntimeError("dynamo down during fallback save")
+            await original_save(wf)
+
+        state_store.save = _flaky_save  # type: ignore[assignment]
+
+        # Must not raise.
+        await manager._monitor_workflow(workflow.id)
+
+        # Cleanup happened despite the fallback save failing.
+        assert workflow.id not in manager._running_tasks
+        assert workflow.id not in manager._resolution_events
+        assert workflow.id not in manager._terminal_recorded
+        # Fallback ESCALATED save was attempted (and raised, but was swallowed).
+        assert RemediationState.ESCALATED in save_calls
