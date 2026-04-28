@@ -8,6 +8,26 @@ from hermes.utils.metrics import ExternalService, track_call
 logger = logging.getLogger(__name__)
 
 
+class SlackApiError(Exception):
+    """
+    Raised when the Slack Web API returns ``ok=false`` for a request.
+
+    Slack returns an HTTP 200 with ``{"ok": false, "error": "..."}`` for
+    application-level failures (``invalid_auth``, ``channel_not_found``,
+    ``not_in_channel``, rate limits, ...). Without an exception here those
+    failures slip past :func:`track_call` and silently get recorded as
+    ``EXTERNAL_CALL_DURATION{service="slack", status="success"}`` while
+    ``EXTERNAL_CALL_ERRORS`` stays flat. Raising propagates the failure so
+    ``track_call`` records the error and the caller in
+    :meth:`hermes.core.remediation_manager.RemediationManager._escalate` can
+    set ``ESCALATIONS_SENT{result="failed"}`` and
+    ``SLACK_NOTIFICATIONS{status="error"}`` correctly.
+
+    The class name is bounded (closed-set ``error_type`` label value), so
+    cardinality stays safe.
+    """
+
+
 class SlackClient:
     """Client for sending Slack notifications for escalations."""
     
@@ -27,15 +47,26 @@ class SlackClient:
             logger.warning("No Slack webhook or bot token configured")
     
     async def send_message(
-        self, 
-        text: str, 
+        self,
+        text: str,
         blocks: Optional[List[Dict[str, Any]]] = None,
         channel: Optional[str] = None
     ) -> bool:
         """
         Send a message to Slack.
-        
+
         Uses webhook if available, otherwise bot token.
+
+        Returns:
+            ``True`` on success.
+
+        Raises:
+            httpx.HTTPError: transport/HTTP-level failure.
+            SlackApiError: Slack returned ``ok=false``.
+
+        Returning ``False`` (instead of raising) for the unconfigured branch
+        is intentional: that's a static configuration condition, not a
+        dependency failure, and it never enters :func:`track_call`.
         """
         if self.webhook_url:
             return await self._send_via_webhook(text, blocks)
@@ -44,63 +75,87 @@ class SlackClient:
         else:
             logger.error("Cannot send Slack message: no webhook or bot token configured")
             return False
-    
+
     async def _send_via_webhook(
-        self, 
-        text: str, 
+        self,
+        text: str,
         blocks: Optional[List[Dict[str, Any]]] = None
     ) -> bool:
-        """Send message via incoming webhook."""
+        """
+        Send message via incoming webhook.
+
+        Re-raises on failure (does **not** swallow the exception and return
+        ``False``). The previous swallow-and-return-False behavior caused
+        :func:`track_call` to fall through to the success branch and record
+        ``EXTERNAL_CALL_DURATION{service="slack", status="success"}`` for
+        every failed Slack call, while ``EXTERNAL_CALL_ERRORS`` stayed flat.
+        Aligning with :class:`hermes.clients.jira.JiraClient` and
+        :class:`hermes.clients.alertmanager.AlertmanagerClient`, which both
+        re-raise out of ``track_call``.
+        """
         payload = {"text": text}
         if blocks:
             payload["blocks"] = blocks
-        
+
         async with track_call(ExternalService.SLACK, "webhook_post"):
             async with httpx.AsyncClient() as client:
                 try:
                     response = await client.post(self.webhook_url, json=payload)
                     response.raise_for_status()
-                    logger.info("Sent Slack message via webhook")
-                    return True
                 except httpx.HTTPError as e:
                     logger.error(f"Error sending Slack webhook: {e}")
-                    return False
-    
+                    raise
+                logger.info("Sent Slack message via webhook")
+                return True
+
     async def _send_via_bot(
-        self, 
-        text: str, 
+        self,
+        text: str,
         blocks: Optional[List[Dict[str, Any]]] = None,
         channel: str = None
     ) -> bool:
-        """Send message via Bot Token API."""
+        """
+        Send message via Bot Token API.
+
+        Two failure modes, both re-raised so :func:`track_call` records the
+        error:
+
+        - HTTP-level failure (httpx raises) — re-raised verbatim.
+        - Slack API-level failure (HTTP 200 with ``{"ok": false, ...}``) —
+          surfaced as :class:`SlackApiError`. This is the class of bug the
+          old swallow-and-return-False path hid: the call wire-succeeded but
+          Slack refused to deliver the message, and we need that to count as
+          a service error in metrics and to propagate up to ``_escalate`` so
+          ``ESCALATIONS_SENT{result="failed"}`` increments.
+        """
         url = "https://slack.com/api/chat.postMessage"
         headers = {
             "Authorization": f"Bearer {self.bot_token}",
             "Content-Type": "application/json"
         }
-        
+
         payload = {
             "channel": channel or self.noc_channel,
             "text": text
         }
         if blocks:
             payload["blocks"] = blocks
-        
+
         async with track_call(ExternalService.SLACK, "chat_post_message"):
             async with httpx.AsyncClient() as client:
                 try:
                     response = await client.post(url, headers=headers, json=payload)
                     response.raise_for_status()
                     result = response.json()
-                    if result.get("ok"):
-                        logger.info(f"Sent Slack message to {channel}")
-                        return True
-                    else:
-                        logger.error(f"Slack API error: {result.get('error')}")
-                        return False
                 except httpx.HTTPError as e:
                     logger.error(f"Error sending Slack message: {e}")
-                    return False
+                    raise
+                if not result.get("ok"):
+                    error = result.get("error", "unknown")
+                    logger.error(f"Slack API error: {error}")
+                    raise SlackApiError(f"Slack API returned ok=false: {error}")
+                logger.info(f"Sent Slack message to {channel}")
+                return True
     
     async def send_escalation(
         self,

@@ -15,6 +15,26 @@ logger = logging.getLogger(__name__)
 
 #TODO: figure out how to get API token with no expiration so that we can deprecate session auth, its bad and ugly
 
+
+class RundeckLoginError(Exception):
+    """
+    Raised when Rundeck login completes at the HTTP level but does not
+    establish a usable session.
+
+    The classic case: ``j_security_check`` returns 200 (after following
+    redirects) but the response carries no ``JSESSIONID`` cookie because the
+    credentials were rejected. Without an exception here that condition slips
+    past :func:`track_call` and silently records
+    ``EXTERNAL_CALL_DURATION{service="rundeck", operation="login",
+    status="success"}`` while ``EXTERNAL_CALL_ERRORS`` stays flat. Raising
+    propagates the failure so the metric is attributed correctly and so that
+    callers (``_request``) get a clear exception instead of a stale ``False``.
+
+    The class name is bounded (closed-set ``error_type`` label value), so
+    cardinality stays safe.
+    """
+
+
 class RundeckClient:
     """Async Rundeck API client with automatic session management."""
     
@@ -54,12 +74,30 @@ class RundeckClient:
             logger.info("RundeckClient configured for token-based authentication")
     
     async def _login(self) -> bool:
-        """Authenticate with Rundeck and obtain session cookie."""
+        """
+        Authenticate with Rundeck and obtain a session cookie.
+
+        Returns:
+            ``True`` on success (or when token auth is in use and no login
+            is required).
+
+        Raises:
+            httpx.HTTPError: transport/HTTP-level failure during the login
+                request. Re-raised so :func:`track_call` records the error.
+            RundeckLoginError: the login request succeeded at the HTTP level
+                but no ``JSESSIONID`` cookie was returned (typically a
+                credential rejection). Re-raised for the same reason.
+
+        The previous implementation swallowed both failure modes and
+        returned ``False``, which caused :func:`track_call` to record every
+        failed login as ``status="success"``. See :class:`RundeckLoginError`
+        for the full rationale.
+        """
         if not self._use_session_auth:
             return True  # Token auth doesn't need login
-        
+
         logger.info("Authenticating with Rundeck using username/password...")
-        
+
         async with track_call(ExternalService.RUNDECK, "login"):
             async with httpx.AsyncClient(verify=self.verify_ssl, timeout=self.timeout) as client:
                 try:
@@ -71,21 +109,25 @@ class RundeckClient:
                         },
                         follow_redirects=True
                     )
-                    
-                    # Extract JSESSIONID cookie from response cookies
-                    # Check both response cookies and client cookies
-                    self._session_cookie = response.cookies.get("JSESSIONID") or client.cookies.get("JSESSIONID")
-                    
-                    if self._session_cookie:
-                        logger.info(f"Successfully authenticated with Rundeck (session: {self._session_cookie[:8]}...)")
-                        return True
-                    else:
-                        logger.error("Failed to obtain session cookie from Rundeck")
-                        return False
-                        
                 except httpx.HTTPError as e:
                     logger.error(f"Failed to authenticate with Rundeck: {e}")
-                    return False
+                    raise
+
+                # Extract JSESSIONID cookie from response cookies
+                # Check both response cookies and client cookies
+                self._session_cookie = response.cookies.get("JSESSIONID") or client.cookies.get("JSESSIONID")
+
+                if not self._session_cookie:
+                    logger.error("Failed to obtain session cookie from Rundeck")
+                    raise RundeckLoginError(
+                        "Login response did not include a JSESSIONID cookie"
+                    )
+
+                logger.info(
+                    f"Successfully authenticated with Rundeck "
+                    f"(session: {self._session_cookie[:8]}...)"
+                )
+                return True
     
     def _get_headers(self) -> Dict[str, str]:
         """Get headers for API requests."""
@@ -115,11 +157,14 @@ class RundeckClient:
     ) -> Dict[str, Any]:
         """Make an authenticated request to Rundeck API."""
         
-        # Ensure we have a session for session-based auth
+        # Ensure we have a session for session-based auth.
+        # ``_login`` now raises (httpx.HTTPError / RundeckLoginError) on
+        # failure rather than returning False, so propagating directly is
+        # both correct and lets the inner login ``track_call`` attribute the
+        # error to operation="login".
         if self._use_session_auth and not self._session_cookie:
-            if not await self._login():
-                raise Exception("Failed to authenticate with Rundeck")
-        
+            await self._login()
+
         url = f"{self.base_url}/api/{self.api_version}{endpoint}"
         
         async with httpx.AsyncClient(
@@ -135,15 +180,15 @@ class RundeckClient:
                     json=json_data
                 )
                 
-                # Handle session expiry - re-authenticate and retry
-                # Rundeck returns 401 or 403 when session is expired/invalid
+                # Handle session expiry - re-authenticate and retry.
+                # Rundeck returns 401 or 403 when session is expired/invalid.
+                # ``_login`` raises on failure, so on a successful return we
+                # always have a fresh session and can replay the request.
                 if response.status_code in (401, 403) and self._use_session_auth and retry_on_auth_failure:
                     logger.warning(f"Session expired or unauthorized ({response.status_code}), re-authenticating...")
                     self._session_cookie = None
-                    if await self._login():
-                        return await self._request(method, endpoint, json_data, retry_on_auth_failure=False)
-                    else:
-                        raise Exception("Failed to re-authenticate with Rundeck")
+                    await self._login()
+                    return await self._request(method, endpoint, json_data, retry_on_auth_failure=False)
                 
                 response.raise_for_status()
                 response_json = response.json()

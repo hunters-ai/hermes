@@ -3,6 +3,7 @@ import asyncio
 import os
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -548,3 +549,239 @@ class TestClassifyDedupReason:
 
     def test_empty_inputs(self):
         assert _classify_dedup_reason(None, None) == "other"
+
+
+# --- External client error attribution --------------------------------------
+#
+# Regression coverage for the silent-success bug: clients that swallowed
+# ``httpx.HTTPError`` internally and returned ``False`` caused
+# ``track_call`` to fall through to its ``else`` branch and record
+# ``status="success"`` for every failed Slack / Rundeck-login call. These
+# tests pin the contract that those clients now propagate exceptions, so
+# the ``track_call`` error path runs and ``EXTERNAL_CALL_ERRORS`` is
+# attributed correctly. The pattern follows ``JiraClient`` /
+# ``AlertmanagerClient``, which already re-raise.
+
+
+class TestSlackClientErrorAttribution:
+    """``SlackClient`` must surface failures to :func:`track_call`.
+
+    Two failure modes are covered:
+
+    - HTTP-level failure inside ``_send_via_webhook`` / ``_send_via_bot``
+      (the original bug the user reported).
+    - Slack API-level failure (``ok=false`` on a 200 response) inside
+      ``_send_via_bot``. Same class of bug — the call wire-succeeded but
+      Slack refused to deliver — and equally invisible in metrics until we
+      raised :class:`hermes.clients.slack.SlackApiError`.
+    """
+
+    @pytest.mark.asyncio
+    async def test_send_via_webhook_records_error_on_http_failure(self, monkeypatch):
+        from hermes.clients import slack as slack_module
+        from hermes.clients.slack import SlackClient
+
+        err_before = _counter_value(
+            m.EXTERNAL_CALL_ERRORS,
+            service="slack",
+            operation="webhook_post",
+            error_type="HTTPError",
+        )
+        success_sum_before = m.EXTERNAL_CALL_DURATION.labels(
+            service="slack", operation="webhook_post", status="success"
+        )._sum.get()  # type: ignore[attr-defined]
+
+        class _FailingClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, *args, **kwargs):
+                raise httpx.HTTPError("connection refused")
+
+        monkeypatch.setattr(slack_module.httpx, "AsyncClient", lambda *a, **k: _FailingClient())
+
+        client = SlackClient(webhook_url="https://hooks.slack.example/AAA/BBB/CCC")
+
+        with pytest.raises(httpx.HTTPError):
+            await client._send_via_webhook("hello")
+
+        err_after = _counter_value(
+            m.EXTERNAL_CALL_ERRORS,
+            service="slack",
+            operation="webhook_post",
+            error_type="HTTPError",
+        )
+        success_sum_after = m.EXTERNAL_CALL_DURATION.labels(
+            service="slack", operation="webhook_post", status="success"
+        )._sum.get()  # type: ignore[attr-defined]
+
+        assert err_after == err_before + 1
+        assert success_sum_after == success_sum_before, (
+            "Failed Slack webhook posts must NOT show up as success latency. "
+            "If this fires, _send_via_webhook is swallowing the exception again "
+            "and track_call is falling through to its else branch."
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_via_bot_records_error_on_slack_api_failure(self, monkeypatch):
+        """``ok=false`` on a 200 must propagate as :class:`SlackApiError`."""
+        from hermes.clients import slack as slack_module
+        from hermes.clients.slack import SlackApiError, SlackClient
+
+        err_before = _counter_value(
+            m.EXTERNAL_CALL_ERRORS,
+            service="slack",
+            operation="chat_post_message",
+            error_type="SlackApiError",
+        )
+        success_sum_before = m.EXTERNAL_CALL_DURATION.labels(
+            service="slack", operation="chat_post_message", status="success"
+        )._sum.get()  # type: ignore[attr-defined]
+
+        class _OkFalseResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"ok": False, "error": "channel_not_found"}
+
+        class _OkFalseClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, *args, **kwargs):
+                return _OkFalseResponse()
+
+        monkeypatch.setattr(slack_module.httpx, "AsyncClient", lambda *a, **k: _OkFalseClient())
+
+        client = SlackClient(bot_token="xoxb-test-token")
+
+        with pytest.raises(SlackApiError):
+            await client._send_via_bot("hello", channel="#nonexistent")
+
+        err_after = _counter_value(
+            m.EXTERNAL_CALL_ERRORS,
+            service="slack",
+            operation="chat_post_message",
+            error_type="SlackApiError",
+        )
+        success_sum_after = m.EXTERNAL_CALL_DURATION.labels(
+            service="slack", operation="chat_post_message", status="success"
+        )._sum.get()  # type: ignore[attr-defined]
+
+        assert err_after == err_before + 1
+        assert success_sum_after == success_sum_before
+
+
+class TestRundeckLoginErrorAttribution:
+    """``RundeckClient._login`` must surface failures to :func:`track_call`."""
+
+    @pytest.mark.asyncio
+    async def test_login_records_error_on_http_failure(self, monkeypatch):
+        from hermes.clients import rundeck as rundeck_module
+        from hermes.clients.rundeck import RundeckClient
+
+        err_before = _counter_value(
+            m.EXTERNAL_CALL_ERRORS,
+            service="rundeck",
+            operation="login",
+            error_type="HTTPError",
+        )
+        success_sum_before = m.EXTERNAL_CALL_DURATION.labels(
+            service="rundeck", operation="login", status="success"
+        )._sum.get()  # type: ignore[attr-defined]
+
+        class _FailingClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, *args, **kwargs):
+                raise httpx.HTTPError("connection refused")
+
+        monkeypatch.setattr(
+            rundeck_module.httpx, "AsyncClient", lambda *a, **k: _FailingClient()
+        )
+
+        client = RundeckClient(
+            base_url="https://rundeck.example/", username="u", password="p"
+        )
+
+        with pytest.raises(httpx.HTTPError):
+            await client._login()
+
+        err_after = _counter_value(
+            m.EXTERNAL_CALL_ERRORS,
+            service="rundeck",
+            operation="login",
+            error_type="HTTPError",
+        )
+        success_sum_after = m.EXTERNAL_CALL_DURATION.labels(
+            service="rundeck", operation="login", status="success"
+        )._sum.get()  # type: ignore[attr-defined]
+
+        assert err_after == err_before + 1
+        assert success_sum_after == success_sum_before, (
+            "Failed Rundeck logins must NOT show up as success latency. "
+            "If this fires, _login is swallowing the exception again and "
+            "track_call is falling through to its else branch."
+        )
+
+    @pytest.mark.asyncio
+    async def test_login_records_error_when_session_cookie_is_missing(self, monkeypatch):
+        """200 response with no JSESSIONID -> :class:`RundeckLoginError`."""
+        from hermes.clients import rundeck as rundeck_module
+        from hermes.clients.rundeck import RundeckClient, RundeckLoginError
+
+        err_before = _counter_value(
+            m.EXTERNAL_CALL_ERRORS,
+            service="rundeck",
+            operation="login",
+            error_type="RundeckLoginError",
+        )
+
+        class _EmptyCookieJar:
+            def get(self, _name, default=None):
+                return default
+
+        class _Response:
+            cookies = _EmptyCookieJar()
+
+        class _NoCookieClient:
+            cookies = _EmptyCookieJar()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, *args, **kwargs):
+                return _Response()
+
+        monkeypatch.setattr(
+            rundeck_module.httpx, "AsyncClient", lambda *a, **k: _NoCookieClient()
+        )
+
+        client = RundeckClient(
+            base_url="https://rundeck.example/", username="u", password="wrong"
+        )
+
+        with pytest.raises(RundeckLoginError):
+            await client._login()
+
+        err_after = _counter_value(
+            m.EXTERNAL_CALL_ERRORS,
+            service="rundeck",
+            operation="login",
+            error_type="RundeckLoginError",
+        )
+        assert err_after == err_before + 1
