@@ -218,3 +218,70 @@ async def test_custom_payload_option_name(mock_config_with_payload_forwarding):
     # Verify it's valid JSON
     parsed = json.loads(job_options["custom_alert_data"])
     assert parsed["alert_name"] == alert_name
+
+
+def test_alert_processor_constructor_does_not_accept_remediation_manager():
+    """
+    ``AlertProcessor`` must not own a ``RemediationManager`` reference.
+
+    The remediation lifecycle (dedup gate, ``start_remediation``,
+    ``REMEDIATION_WORKFLOWS`` increment, audit log, response shaping) is
+    owned end-to-end by the HTTP handlers. Earlier revisions also had
+    ``send_to_webhook`` call ``start_remediation``, which combined with
+    the outer call to silently create two workflows + two monitor tasks
+    per alert and double every workflow lifecycle metric. Pin the
+    constructor signature so that drift cannot reintroduce that path.
+    """
+    import inspect
+    sig = inspect.signature(AlertProcessor.__init__)
+    assert "remediation_manager" not in sig.parameters, (
+        "AlertProcessor.__init__ must not accept a remediation_manager "
+        "argument; remediation lifecycle is owned by the HTTP handlers."
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_to_webhook_does_not_start_remediation_workflow(
+    mock_config_with_payload_forwarding,
+):
+    """
+    ``AlertProcessor.send_to_webhook`` is a Rundeck trigger, not a
+    workflow lifecycle entry point. It must never reach into a remediation
+    manager. This guards against the historical regression where an inner
+    ``start_remediation`` call inside ``send_to_webhook`` ran in addition
+    to the outer call in ``receive_alert`` / ``receive_public_webhook``,
+    creating two workflow rows, two monitor tasks, two cooldown updates,
+    and doubling every workflow lifecycle metric per alert.
+    """
+    mock_rundeck = AsyncMock()
+    mock_rundeck.run_job.return_value = {
+        "id": "12345",
+        "permalink": "https://rundeck.example.com/project/ops/execution/show/12345",
+    }
+
+    processor = AlertProcessor(
+        config=mock_config_with_payload_forwarding,
+        rundeck=mock_rundeck,
+        jira=None,
+    )
+
+    sentinel_manager = MagicMock(name="remediation_manager_sentinel")
+    sentinel_manager.start_remediation = AsyncMock()
+    processor.remediation_manager = sentinel_manager  # type: ignore[attr-defined]
+
+    full_alert_context = {
+        "alert_name": "NodeNotReady",
+        "alert_labels": {"cluster": "us-west-2-prod"},
+        "alert_time": "2026-01-29T12:00:00Z",
+        "source_alertmanager": "https://alertmanager.us-west-2.example.com",
+    }
+
+    await processor.send_to_webhook(
+        alert_name="NodeNotReady",
+        payload={"cluster": "us-west-2-prod"},
+        alert_time="2026-01-29T12:00:00Z",
+        full_alert_context=full_alert_context,
+    )
+
+    sentinel_manager.start_remediation.assert_not_called()
+    sentinel_manager.assert_not_called()

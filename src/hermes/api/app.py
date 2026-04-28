@@ -244,11 +244,24 @@ class AlertPayload(BaseModel):
 class AlertProcessor:
     """Processes incoming alerts and triggers Rundeck jobs."""
     
-    def __init__(self, config: Config, rundeck: RundeckClient, jira: Optional[JiraClient] = None, remediation_manager: Optional[RemediationManager] = None):
+    def __init__(self, config: Config, rundeck: RundeckClient, jira: Optional[JiraClient] = None):
+        """
+        Triggers Rundeck jobs for incoming alerts.
+
+        ``AlertProcessor`` deliberately does **not** hold a reference to the
+        ``RemediationManager``. The remediation lifecycle (dedup gate,
+        ``start_remediation`` call, ``REMEDIATION_WORKFLOWS`` increment, audit
+        log, response shaping) is owned end-to-end by the HTTP handlers
+        (``receive_alert`` / ``receive_public_webhook``). Earlier revisions
+        also kicked off ``start_remediation`` from inside ``send_to_webhook``,
+        which combined with the outer call to silently create two workflows,
+        two monitor tasks, and double every workflow lifecycle metric per
+        alert. Keep this constructor remediation-free so that drift cannot
+        reintroduce that bug.
+        """
         self.config = config
         self.rundeck = rundeck
         self.jira = jira
-        self.remediation_manager = remediation_manager
 
     def generate_split_payloads(
         self, 
@@ -530,22 +543,14 @@ class AlertProcessor:
             RUNDECK_JOB_TRIGGERS.labels(alert_type=alert_name, status="triggered").inc()
             logger.info(f"Triggered Rundeck job {resolved_job_id} -> execution {exec_id}")
 
-            # If we have a remediation manager available, start the workflow and pass options
-            if self.remediation_manager:
-                # Extract alert labels for matching; reuse your existing logic to derive labels
-                alert_labels_for_match = full_alert_context.get("alert_labels", {}) if full_alert_context else payload.get("alert_labels", {})
-
-                # Start the remediation workflow with rundeck options
-                workflow_id = await self.remediation_manager.start_remediation(
-                    alert_name=alert_name,
-                    alert_labels=alert_labels_for_match,
-                    rundeck_execution_id=exec_id,
-                    rundeck_execution_url=exec_url,
-                    alertmanager_url=extract_alertmanager_url(full_alert_context.get("source_alertmanager") if full_alert_context else None),
-                    rundeck_options=payload
-                )
-                logger.info(f"Started remediation workflow {workflow_id} for alert {alert_name}")
-
+            # Intentionally do NOT call remediation_manager.start_remediation here.
+            # The HTTP handlers (receive_alert / receive_public_webhook) own the
+            # remediation lifecycle for the request: they run the dedup gate,
+            # call start_remediation exactly once on success, bump
+            # REMEDIATION_WORKFLOWS, write the audit log, and shape the
+            # response. Starting it here as well silently created a second
+            # workflow row + monitor task per alert and doubled every
+            # downstream workflow metric.
             return {
                 "status": "triggered",
                 "execution_id": exec_id,
@@ -612,7 +617,7 @@ class AlertProcessor:
         raise ValueError(message)
 
 
-processor = AlertProcessor(app_config, rundeck_client, jira_client, remediation_manager) if app_config and rundeck_client else None
+processor = AlertProcessor(app_config, rundeck_client, jira_client) if app_config and rundeck_client else None
 
 
 _TRACKED_ENDPOINTS = {
