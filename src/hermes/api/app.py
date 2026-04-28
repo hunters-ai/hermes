@@ -622,13 +622,25 @@ _TRACKED_ENDPOINTS = {
 
 
 def _classify_dedup_reason(skip_reason: Optional[str], existing_workflow_id: Optional[str]) -> str:
-    """Map the free-form skip reason from the manager to a closed-set label."""
+    """Map the free-form skip reason from the manager to a closed-set label.
+
+    Order matters: ``RemediationManager.check_deduplication`` populates the
+    ``existing_workflow_id`` tuple element on *both* the active-workflow and
+    the cooldown branches (the cooldown branch returns the previous workflow
+    id). Branching on ``existing_workflow_id`` first would therefore label
+    every cooldown skip as ``active_workflow`` and conflate concurrency with
+    flapping. Inspect the reason text first and use ``existing_workflow_id``
+    only as a fallback when no reason was provided.
+    """
+    reason_lc = skip_reason.lower() if skip_reason else ""
+    if "cooldown" in reason_lc:
+        return "cooldown"
+    if "max concurrent" in reason_lc:
+        return "concurrency_limit"
+    if "active workflow" in reason_lc:
+        return "active_workflow"
     if existing_workflow_id:
         return "active_workflow"
-    if skip_reason and "cooldown" in skip_reason.lower():
-        return "cooldown"
-    if skip_reason and "max concurrent" in skip_reason.lower():
-        return "concurrency_limit"
     return "other"
 
 

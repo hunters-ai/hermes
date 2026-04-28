@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 # Set config path before importing app
 os.environ.setdefault("CONFIG_PATH", "config/config.yaml")
 
-from hermes.api.app import app
+from hermes.api.app import _classify_dedup_reason, app
 from hermes.config import Config, RemediationConfig
 from hermes.core.remediation_manager import RemediationManager
 from hermes.core.state_store import (
@@ -228,3 +228,34 @@ class TestTrackCall:
             error_type="ValueError",
         )
         assert after == before + 1
+
+
+class TestClassifyDedupReason:
+    """Reasons returned by ``RemediationManager.check_deduplication``.
+
+    The cooldown branch returns the previous workflow id as the third tuple
+    element, so the classifier must inspect the reason text first — branching
+    on ``existing_workflow_id`` would otherwise misclassify cooldowns as
+    ``active_workflow`` and conflate concurrency with flapping.
+    """
+
+    def test_active_workflow_skip(self):
+        reason = "Active workflow wf-123 already exists for this alert"
+        assert _classify_dedup_reason(reason, "wf-123") == "active_workflow"
+
+    def test_cooldown_skip_with_workflow_id(self):
+        reason = "Alert in cooldown (1.2/5 minutes), last workflow: wf-prev"
+        assert _classify_dedup_reason(reason, "wf-prev") == "cooldown"
+
+    def test_concurrency_limit_skip(self):
+        reason = "Max concurrent workflows (10) reached"
+        assert _classify_dedup_reason(reason, None) == "concurrency_limit"
+
+    def test_unknown_reason_with_workflow_id_falls_back_to_active(self):
+        assert _classify_dedup_reason("something custom", "wf-x") == "active_workflow"
+
+    def test_unknown_reason_without_workflow_id(self):
+        assert _classify_dedup_reason("something custom", None) == "other"
+
+    def test_empty_inputs(self):
+        assert _classify_dedup_reason(None, None) == "other"
