@@ -21,11 +21,16 @@ src/hermes/core/remediation_manager.py
 src/hermes/core/state_store.py
 src/hermes/utils/__init__.py
 src/hermes/utils/audit_logger.py
+src/hermes/utils/metrics.py
 src/hermes/utils/rate_limiter.py
+tests/test_alert_payload_forwarding.py
 tests/test_audit_logger.py
 tests/test_circuit_breaker.py
 tests/test_deduplication.py
 tests/test_health_endpoints.py
+tests/test_job_id_mappings.py
 tests/test_metrics.py
+tests/test_public_webhook.py
 tests/test_rate_limiter.py
+tests/test_value_mappings.py
 tests/test_workflow_recovery.py

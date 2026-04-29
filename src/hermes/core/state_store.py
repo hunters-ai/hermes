@@ -7,6 +7,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Dict, Optional, List
 
+from hermes.utils.metrics import ExternalService, track_call
+
 logger = logging.getLogger(__name__)
 
 
@@ -259,15 +261,17 @@ class DynamoDBStateStore(StateStore):
         """Save or update a workflow."""
         item = self._workflow_to_item(workflow)
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: self.table.put_item(Item=item))
+        async with track_call(ExternalService.DYNAMODB, "save"):
+            await loop.run_in_executor(None, lambda: self.table.put_item(Item=item))
     
     async def get(self, workflow_id: str) -> Optional[RemediationWorkflow]:
         """Get a workflow by ID."""
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None, 
-            lambda: self.table.get_item(Key={"id": workflow_id})
-        )
+        async with track_call(ExternalService.DYNAMODB, "get"):
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.table.get_item(Key={"id": workflow_id})
+            )
         item = response.get("Item")
         return self._item_to_workflow(item) if item else None
     
@@ -276,13 +280,14 @@ class DynamoDBStateStore(StateStore):
         from boto3.dynamodb.conditions import Key
         
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: self.table.query(
-                IndexName=self.EXECUTION_ID_INDEX,
-                KeyConditionExpression=Key("rundeck_execution_id").eq(execution_id)
+        async with track_call(ExternalService.DYNAMODB, "get_by_execution_id"):
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.table.query(
+                    IndexName=self.EXECUTION_ID_INDEX,
+                    KeyConditionExpression=Key("rundeck_execution_id").eq(execution_id)
+                )
             )
-        )
         items = response.get("Items", [])
         return self._item_to_workflow(items[0]) if items else None
     
@@ -295,20 +300,21 @@ class DynamoDBStateStore(StateStore):
         active_states = [s.value for s in RemediationState if s.value not in completed_states]
         
         all_workflows = []
-        try:
-            for state in active_states:
+        async with track_call(ExternalService.DYNAMODB, "list_active"):
+            try:
+                for state in active_states:
+                    response = await loop.run_in_executor(
+                        None,
+                        lambda s=state: self.table.scan(FilterExpression=Attr("state").eq(s))
+                    )
+                    all_workflows.extend(response.get("Items", []))
+            except Exception as e:
+                logger.warning(f"GSI query failed, falling back to scan: {e}")
                 response = await loop.run_in_executor(
                     None,
-                    lambda s=state: self.table.scan(FilterExpression=Attr("state").eq(s))
+                    lambda: self.table.scan(FilterExpression=Attr("state").is_in(active_states))
                 )
-                all_workflows.extend(response.get("Items", []))
-        except Exception as e:
-            logger.warning(f"GSI query failed, falling back to scan: {e}")
-            response = await loop.run_in_executor(
-                None,
-                lambda: self.table.scan(FilterExpression=Attr("state").is_in(active_states))
-            )
-            all_workflows = response.get("Items", [])
+                all_workflows = response.get("Items", [])
         
         return [self._item_to_workflow(item) for item in all_workflows]
     
@@ -331,28 +337,29 @@ class DynamoDBStateStore(StateStore):
         # Query the GSI for each active state since state is a key attribute
         # Cannot use FilterExpression on GSI key attributes
         items = []
-        try:
-            for state in active_states:
+        async with track_call(ExternalService.DYNAMODB, "get_by_alert_labels"):
+            try:
+                for state in active_states:
+                    response = await loop.run_in_executor(
+                        None,
+                        lambda s=state: self.table.query(
+                            IndexName=self.ALERT_NAME_STATE_INDEX,
+                            KeyConditionExpression=Key("alert_name").eq(alert_name) & Key("state").eq(s)
+                        )
+                    )
+                    items.extend(response.get("Items", []))
+            except Exception as e:
+                logger.warning(f"GSI query failed for alert_name '{alert_name}', falling back to scan: {e}")
                 response = await loop.run_in_executor(
                     None,
-                    lambda s=state: self.table.query(
-                        IndexName=self.ALERT_NAME_STATE_INDEX,
-                        KeyConditionExpression=Key("alert_name").eq(alert_name) & Key("state").eq(s)
+                    lambda: self.table.scan(
+                        FilterExpression=(
+                            Attr("alert_name").eq(alert_name) &
+                            Attr("state").is_in(active_states)
+                        )
                     )
                 )
-                items.extend(response.get("Items", []))
-        except Exception as e:
-            logger.warning(f"GSI query failed for alert_name '{alert_name}', falling back to scan: {e}")
-            response = await loop.run_in_executor(
-                None,
-                lambda: self.table.scan(
-                    FilterExpression=(
-                        Attr("alert_name").eq(alert_name) &
-                        Attr("state").is_in(active_states)
-                    )
-                )
-            )
-            items = response.get("Items", [])
+                items = response.get("Items", [])
         
         for item in items:
             workflow = self._item_to_workflow(item)
@@ -363,7 +370,8 @@ class DynamoDBStateStore(StateStore):
     async def delete(self, workflow_id: str) -> None:
         """Delete a workflow."""
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: self.table.delete_item(Key={"id": workflow_id})
-        )
+        async with track_call(ExternalService.DYNAMODB, "delete"):
+            await loop.run_in_executor(
+                None,
+                lambda: self.table.delete_item(Key={"id": workflow_id})
+            )

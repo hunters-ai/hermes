@@ -447,26 +447,52 @@ hermes/
 
 ## Prometheus Metrics
 
-Hermes exposes metrics on `/metrics` for monitoring:
+Hermes exposes metrics on `/metrics` for monitoring. Metrics are defined in
+`src/hermes/utils/metrics.py` (the single source of truth) and grouped below by
+the question they help answer.
 
-### Request Metrics
-- `hermes_incoming_requests_total` - Total incoming alert requests
-- `hermes_webhook_requests_total` - Webhook requests sent to Rundeck
-- `hermes_webhook_errors_total` - Webhook request errors
-- `hermes_processing_duration_seconds` - Processing time histogram
+### HTTP layer
+- `hermes_incoming_requests_total{endpoint,status}` - Incoming HTTP requests by route and status code
+- `hermes_processing_duration_seconds{endpoint}` - Per-route latency histogram
 
-### Remediation Metrics
-- `hermes_rundeck_job_triggers_total{status}` - Job triggers by status (success/failed)
-- `hermes_remediation_workflows_total` - Remediation workflows started
-- `hermes_remediation_outcomes_total{alert_type, outcome}` - Outcomes by result
-  - `outcome=success` - Alert resolved after remediation
-  - `outcome=job_failed` - Rundeck job failed
-  - `outcome=alert_still_firing` - Alert not resolved after job succeeded
+### Alert intake / dedup
+- `hermes_alerts_received_total{alert_type}` - Alerts received per type
+- `hermes_processing_errors_total{error_type,alert_type}` - Errors raised while handling inbound alerts
+- `hermes_alerts_deduplicated_total{alert_type,reason}` - Alerts skipped (`reason` ∈ `active_workflow|cooldown|concurrency_limit|other`)
+- `hermes_concurrency_limit_hit_total{alert_type}` - Workflows rejected because the global cap was reached
+- `hermes_rate_limited_requests_total{source,limit_type}` - Rate limited requests
 
-### Reliability Metrics
-- `hermes_alerts_deduplicated_total{alert_type, reason}` - Alerts skipped due to deduplication
+### Workflow lifecycle
+- `hermes_remediation_workflows_total{alert_type}` - Workflows started
+- `hermes_remediation_outcomes_total{alert_type,outcome,attempts}` - Terminal outcomes; `attempts` lets you compute first-attempt success rate
+  - `outcome ∈ success | job_success_no_resolution_check | job_failed | alert_still_firing | retrigger_failed | missing_options | escalated`
+- `hermes_remediation_retries_total{alert_type,attempt_number}` - Retry attempts initiated (`attempt_number=2` means first retry)
+- `hermes_resolution_source_total{alert_type,source}` - How resolution was determined (`webhook|polling|skip_resolution_check|timeout`)
+- `hermes_workflow_recovery_total{outcome}` - Outcomes of workflow recovery on restart
+- `hermes_active_workflows` - In-flight workflow gauge
+
+### Durations
+- `hermes_remediation_duration_seconds{alert_type,outcome}` - End-to-end workflow duration
+- `hermes_job_execution_duration_seconds{alert_type,status}` - Rundeck job runtime
+- `hermes_alert_resolution_wait_seconds{alert_type,method}` - Time spent waiting for the alert to clear after job success
+
+### External services
+- `hermes_external_call_duration_seconds{service,operation,status}` - External call latency
+- `hermes_external_call_errors_total{service,operation,error_type}` - External call failures
+- `hermes_rundeck_job_triggers_total{alert_type,status}` - Rundeck job trigger outcomes
+- `hermes_jira_operations_total{operation,status}` - JIRA writes/reads issued by Hermes
+- `hermes_jira_ticket_fetch_total{alert_type,status}` - Legacy JIRA ticket-lookup counter (kept for back-compat)
+
+### Reliability
 - `hermes_circuit_breaker_trips_total{service}` - Circuit breaker activations
-- `hermes_rate_limited_requests_total{source, limit_type}` - Rate limited requests
+- `hermes_circuit_breaker_state{service}` - Current breaker state (0=closed, 1=open)
+
+### Notifications
+- `hermes_escalations_sent_total{alert_type,target,result}` - Escalations dispatched
+- `hermes_slack_notifications_total{type,status}` - Slack send attempts
+
+### Build / config
+- `hermes_build_info{version,commit,config_hash}` - Always 1; use the labels for deploy/version tracking
 
 ## Environment Variables
 

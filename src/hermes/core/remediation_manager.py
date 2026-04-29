@@ -12,7 +12,7 @@ This is the core orchestration component that:
 import asyncio
 import logging
 import uuid
-from typing import Dict, Any, Optional, Tuple, Callable
+from typing import Dict, Any, Optional, Set, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 
@@ -23,9 +23,24 @@ from hermes.clients.alertmanager import AlertmanagerClient
 from hermes.clients.rundeck import RundeckClient
 from hermes.clients.jira import JiraClient
 from hermes.clients.slack import SlackClient
+from hermes.utils import metrics
+from hermes.utils.metrics import (
+    ExternalService,
+    JiraOperation,
+    RemediationOutcome,
+    ResolutionSource,
+    SlackNotificationType,
+    WorkflowRecoveryOutcome,
+    bucket_attempts,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+# Default escalation target label value when no per-alert routing is configured.
+# Replace with a per-alert config field once team routing is added.
+DEFAULT_ESCALATION_TARGET = "noc"
 
 
 @dataclass
@@ -62,8 +77,30 @@ class AlertCooldown:
     workflow_id: str
 
 
-# Metrics callback type for recording outcomes
-MetricsCallback = Callable[[str, str], None]  # (alert_name, outcome) -> None
+@dataclass
+class _WorkflowFallback:
+    """In-memory fallback metadata for terminal metric recording.
+
+    Populated when a monitor task is started (``start_remediation`` and the
+    recovery path in ``recover_active_workflows``) and refreshed on every
+    successful retrigger. It exists for one purpose: when the outer
+    exception handler in ``_monitor_workflow`` runs and the state store is
+    unavailable (so ``state_store.get`` raises or returns ``None``), this
+    dict still has enough information to emit ``REMEDIATION_OUTCOMES`` and
+    ``REMEDIATION_DURATION``. Without it the started-vs-terminal invariant
+    (every workflow incremented in ``REMEDIATION_WORKFLOWS`` should also
+    appear in ``REMEDIATION_OUTCOMES``) would silently drift low by one
+    sample for every state-store-down crash, even though the workflow's
+    slot in ``_running_tasks`` is correctly released.
+
+    All fields use the same closed-set semantics as the regular path:
+    ``alert_name`` is bounded by ``config.yaml``; ``attempts`` is bounded
+    by ``remediation.max_attempts``.
+    """
+
+    alert_name: str
+    created_at: datetime
+    attempts: int = 1
 
 
 class RemediationManager:
@@ -90,7 +127,6 @@ class RemediationManager:
         config: Config, 
         state_store: StateStore, 
         rundeck_client: RundeckClient,
-        metrics_callback: Optional[MetricsCallback] = None
     ):
         self.config = config
         self.state_store = state_store
@@ -108,9 +144,6 @@ class RemediationManager:
             config.remediation, 'circuit_breaker_recovery_seconds',
             self.DEFAULT_CIRCUIT_RECOVERY_TIMEOUT
         )
-        
-        # Metrics callback for recording outcomes
-        self._metrics_callback = metrics_callback
         
         # Use shared client
         self.job_monitor = JobMonitor(rundeck_client)
@@ -144,20 +177,38 @@ class RemediationManager:
         self._running_tasks: Dict[str, asyncio.Task] = {}
         # Track resolution events for early termination via webhook
         self._resolution_events: Dict[str, asyncio.Event] = {}
+        # Workflow ids that already had a terminal outcome / duration recorded.
+        # Used to keep ``_record_terminal`` idempotent so that an exception in
+        # ``_escalate`` (or any post-record step) doesn't cause the outer
+        # exception handler in ``_monitor_workflow`` to record a *second*
+        # terminal sample with ``outcome="escalated"``. Cleared in the
+        # ``finally`` block of ``_monitor_workflow`` / ``_resume_workflow``.
+        self._terminal_recorded: Set[str] = set()
+        # In-memory fallback metadata for every running workflow. See
+        # ``_WorkflowFallback`` for the rationale; the short version is that
+        # the outer exception handler in ``_monitor_workflow`` may run while
+        # the state store is unavailable, in which case we still need
+        # ``alert_name`` / ``created_at`` / ``attempts`` to emit a terminal
+        # metric and keep started-vs-terminal balanced. Populated on
+        # workflow start, refreshed on retrigger, dropped in ``finally``.
+        self._workflow_fallback: Dict[str, _WorkflowFallback] = {}
         
         # Circuit breakers for external services
         self._circuit_breakers: Dict[str, CircuitBreakerState] = {
-            "rundeck": CircuitBreakerState(),
-            "alertmanager": CircuitBreakerState(),
-            "jira": CircuitBreakerState(),
-            "slack": CircuitBreakerState(),
+            ExternalService.RUNDECK: CircuitBreakerState(),
+            ExternalService.ALERTMANAGER: CircuitBreakerState(),
+            ExternalService.JIRA: CircuitBreakerState(),
+            ExternalService.SLACK: CircuitBreakerState(),
         }
+        metrics.init_circuit_breaker_states(self._circuit_breakers.keys())
         
         # Alert cooldown tracking (alert_fingerprint -> cooldown state)
         self._alert_cooldowns: Dict[str, AlertCooldown] = {}
         
         # Rate limiting per Alertmanager source
         self._rate_limiters: Dict[str, Any] = {}
+        
+        metrics.set_active_workflow_count(0)
     
     def _get_alert_fingerprint(self, alert_name: str, alert_labels: Dict[str, str]) -> str:
         """Generate a unique fingerprint for an alert based on name and key labels."""
@@ -209,6 +260,7 @@ class RemediationManager:
         
         # Check 3: Have we hit the concurrent workflow limit?
         if len(self._running_tasks) >= self.max_concurrent_workflows:
+            metrics.CONCURRENCY_LIMIT_HIT.labels(alert_type=alert_name).inc()
             return (
                 True,
                 f"Max concurrent workflows ({self.max_concurrent_workflows}) reached",
@@ -236,24 +288,144 @@ class RemediationManager:
     def record_circuit_success(self, service: str):
         """Record successful call to service."""
         if service in self._circuit_breakers:
-            self._circuit_breakers[service].record_success()
+            cb = self._circuit_breakers[service]
+            was_open = cb.is_open
+            cb.record_success()
+            if was_open:
+                metrics.set_circuit_breaker_state(service, False)
     
     def record_circuit_failure(self, service: str):
         """Record failed call to service."""
         if service in self._circuit_breakers:
             self._circuit_breakers[service].record_failure()
             cb = self._circuit_breakers[service]
-            if cb.failures >= self.circuit_failure_threshold:
+            if cb.failures >= self.circuit_failure_threshold and not cb.is_open:
                 cb.is_open = True
+                metrics.CIRCUIT_BREAKER_TRIPS.labels(service=service).inc()
+                metrics.set_circuit_breaker_state(service, True)
                 logger.warning(f"Circuit breaker OPENED for {service} after {cb.failures} failures")
     
-    def _record_outcome(self, alert_name: str, outcome: str):
-        """Record remediation outcome metric."""
-        if self._metrics_callback:
-            try:
-                self._metrics_callback(alert_name, outcome)
-            except Exception as e:
-                logger.warning(f"Failed to record metric: {e}")
+    def _record_outcome(
+        self,
+        alert_name: str,
+        outcome: str,
+        attempts: int,
+    ) -> None:
+        """
+        Record remediation outcome metric (closed-set ``outcome``).
+
+        ``attempts`` is required and must be an ``int``: the only caller
+        (:meth:`_record_terminal`) substitutes ``1`` for a missing
+        ``workflow.attempts``, so there is no legitimate path that needs an
+        ``"unknown"`` / ``"0"`` placeholder. Keeping the value monotonic and
+        meaningful avoids a confusing hole in attempts-distribution charts.
+
+        The integer is bucketed via :func:`bucket_attempts` before being
+        used as a label so the cardinality of ``REMEDIATION_OUTCOMES``
+        cannot blow up on a per-alert ``max_attempts`` override (the
+        config model has no upper bound). ``attempts="1"`` is preserved
+        exactly so the SLO dashboards' first-attempt success rate query
+        keeps working.
+        """
+        try:
+            metrics.REMEDIATION_OUTCOMES.labels(
+                alert_type=alert_name,
+                outcome=outcome,
+                attempts=bucket_attempts(attempts),
+            ).inc()
+        except Exception as e:  # noqa: BLE001 - metrics never break workflows
+            logger.warning(f"Failed to record outcome metric: {e}")
+    
+    def _record_terminal(
+        self,
+        workflow: RemediationWorkflow,
+        outcome: str,
+    ) -> None:
+        """
+        Record metrics emitted exactly once per workflow at terminal time:
+        the outcome counter and the end-to-end duration histogram.
+
+        Idempotent: subsequent calls for the same ``workflow.id`` are no-ops.
+        This protects against double-counting when an inner handler records
+        the real outcome (e.g. ``retrigger_failed``) and a follow-up step
+        (typically ``_escalate``) raises, causing the outer exception handler
+        in ``_monitor_workflow`` to attempt a second ``escalated`` recording.
+        """
+        self._record_terminal_metrics(
+            workflow_id=workflow.id,
+            alert_name=workflow.alert_name,
+            created_at=workflow.created_at,
+            attempts=workflow.attempts or 1,
+            outcome=outcome,
+        )
+
+    def _record_terminal_from_fallback(
+        self,
+        workflow_id: str,
+        outcome: str,
+    ) -> bool:
+        """Record terminal metrics using ``_workflow_fallback`` metadata.
+
+        Used by the outer exception handler in ``_monitor_workflow`` when
+        ``state_store.get`` raises or returns ``None`` and the regular
+        ``RemediationWorkflow``-based path is therefore unavailable. Without
+        this, a state-store outage at the moment the handler runs would
+        silently drop the terminal sample even though
+        ``REMEDIATION_WORKFLOWS`` was already incremented at start, breaking
+        the started-vs-terminal invariant.
+
+        Idempotent via the same ``_terminal_recorded`` sentinel as
+        :meth:`_record_terminal`. Returns ``True`` if a record was emitted
+        (or skipped because already recorded), ``False`` if no fallback
+        entry exists for ``workflow_id`` so the caller can log accordingly.
+        """
+        fallback = self._workflow_fallback.get(workflow_id)
+        if fallback is None:
+            return False
+        self._record_terminal_metrics(
+            workflow_id=workflow_id,
+            alert_name=fallback.alert_name,
+            created_at=fallback.created_at,
+            attempts=fallback.attempts,
+            outcome=outcome,
+        )
+        return True
+
+    def _record_terminal_metrics(
+        self,
+        *,
+        workflow_id: str,
+        alert_name: str,
+        created_at: datetime,
+        attempts: int,
+        outcome: str,
+    ) -> None:
+        """Idempotent terminal metric emission shared by both call paths.
+
+        Internal helper: callers should use :meth:`_record_terminal` (regular
+        path) or :meth:`_record_terminal_from_fallback` (state-store-down
+        path), which know how to source ``alert_name`` / ``created_at`` /
+        ``attempts`` and which arguments come from a closed set.
+        """
+        if workflow_id in self._terminal_recorded:
+            logger.debug(
+                f"Terminal metrics already recorded for workflow {workflow_id}, "
+                f"skipping outcome={outcome}"
+            )
+            return
+        self._record_outcome(alert_name, outcome, attempts=attempts)
+        try:
+            duration = (datetime.utcnow() - created_at).total_seconds()
+            metrics.REMEDIATION_DURATION.labels(
+                alert_type=alert_name,
+                outcome=outcome,
+            ).observe(duration)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Failed to record remediation duration: {e}")
+        self._terminal_recorded.add(workflow_id)
+    
+    def _refresh_active_workflows_gauge(self) -> None:
+        metrics.set_active_workflow_count(len(self._running_tasks))
     
     async def start_remediation(
         self,
@@ -296,17 +468,29 @@ class RemediationManager:
         
         await self.state_store.save(workflow)
         logger.info(f"Started remediation workflow {workflow_id} for alert {alert_name}")
-        
+
         # Record cooldown for this alert
         fingerprint = self._get_alert_fingerprint(alert_name, alert_labels)
         self._alert_cooldowns[fingerprint] = AlertCooldown(
             last_triggered=datetime.utcnow(),
             workflow_id=workflow_id
         )
-        
+
+        # Stash in-memory fallback metadata before kicking off the monitor
+        # task. If the monitor blows up while the state store is unreachable,
+        # the outer exception handler still has enough to emit a terminal
+        # metric and keep started-vs-terminal balanced. Cleared in the
+        # ``finally`` block of ``_monitor_workflow``.
+        self._workflow_fallback[workflow_id] = _WorkflowFallback(
+            alert_name=alert_name,
+            created_at=workflow.created_at,
+            attempts=workflow.attempts or 1,
+        )
+
         # Start background monitoring task
         task = asyncio.create_task(self._monitor_workflow(workflow_id))
         self._running_tasks[workflow_id] = task
+        self._refresh_active_workflows_gauge()
         
         return workflow_id
     
@@ -352,12 +536,23 @@ class RemediationManager:
                 workflow.update_state(RemediationState.WAITING_RESOLUTION)
                 await self.state_store.save(workflow)
                 
-                alert_resolved = await self._wait_for_alert_resolution(workflow, resolution_event, resolution_wait)
+                resolved, resolution_method = await self._wait_for_alert_resolution(
+                    workflow, resolution_event, resolution_wait
+                )
+                self._record_alert_resolution_wait(workflow, resolution_method)
                 
-                if alert_resolved:
+                if resolved:
+                    metrics.RESOLUTION_SOURCE.labels(
+                        alert_type=workflow.alert_name,
+                        source=resolution_method,
+                    ).inc()
                     await self._handle_success(workflow)
                     return
                 else:
+                    metrics.RESOLUTION_SOURCE.labels(
+                        alert_type=workflow.alert_name,
+                        source=ResolutionSource.TIMEOUT,
+                    ).inc()
                     retry_initiated = await self._handle_alert_still_firing(workflow)
                     if not retry_initiated:
                         return
@@ -368,21 +563,69 @@ class RemediationManager:
         except asyncio.CancelledError:
             logger.info(f"Workflow {workflow_id} monitoring cancelled")
         except Exception as e:
+            # ``_monitor_workflow`` is the single fallback for unhandled
+            # exceptions in the workflow lifecycle. It MUST NOT itself
+            # propagate, because the task is fire-and-forget (created in
+            # ``start_remediation_workflow`` / ``recover_active_workflows``
+            # and never awaited at the call site) — propagation surfaces as
+            # noisy ``Task exception was never retrieved`` warnings and lets
+            # other layers attempt redundant cleanup.
             logger.exception(f"Error in workflow {workflow_id}: {e}")
-            workflow = await self.state_store.get(workflow_id)
+            workflow: Optional[RemediationWorkflow] = None
+            try:
+                workflow = await self.state_store.get(workflow_id)
+            except Exception as fetch_err:  # noqa: BLE001 - best-effort
+                logger.error(
+                    f"Failed to fetch workflow {workflow_id} during fallback "
+                    f"escalation: {fetch_err}"
+                )
             if workflow:
                 workflow.update_state(RemediationState.ESCALATED, str(e))
-                await self.state_store.save(workflow)
+                try:
+                    await self.state_store.save(workflow)
+                except Exception as save_err:  # noqa: BLE001 - best-effort
+                    logger.error(
+                        f"Failed to persist ESCALATED state for workflow "
+                        f"{workflow_id}: {save_err}"
+                    )
+                # No-op if an inner handler already recorded a more specific
+                # terminal outcome before the exception was raised.
+                self._record_terminal(workflow, RemediationOutcome.ESCALATED)
+            else:
+                # State store is unavailable (``get`` raised) or the row is
+                # gone (``get`` returned ``None``). We still need to emit a
+                # terminal sample so ``REMEDIATION_OUTCOMES`` stays balanced
+                # against ``REMEDIATION_WORKFLOWS`` — otherwise a Dynamo
+                # outage at the wrong moment silently drops one terminal
+                # observation per affected workflow even though the slot in
+                # ``_running_tasks`` is correctly released in ``finally``.
+                # The fallback is also idempotent against
+                # ``_terminal_recorded`` so it won't emit a duplicate when
+                # an inner handler already recorded a more specific outcome.
+                if not self._record_terminal_from_fallback(
+                    workflow_id, RemediationOutcome.ESCALATED
+                ):
+                    logger.error(
+                        f"No fallback metadata for workflow {workflow_id}; "
+                        f"terminal outcome metric will be missing for this "
+                        f"workflow. This indicates a programming error: every "
+                        f"workflow that enters ``_monitor_workflow`` should "
+                        f"have a ``_workflow_fallback`` entry registered "
+                        f"before its task is created."
+                    )
         finally:
             self._running_tasks.pop(workflow_id, None)
             self._resolution_events.pop(workflow_id, None)
+            self._terminal_recorded.discard(workflow_id)
+            self._workflow_fallback.pop(workflow_id, None)
+            self._refresh_active_workflows_gauge()
     
     async def _wait_for_alert_resolution(
-        self, 
+        self,
         workflow: RemediationWorkflow,
         resolution_event: asyncio.Event,
         alertmanager_check_delay_minutes: int
-    ) -> bool:
+    ) -> Tuple[bool, str]:
         """
         Wait for alert resolution via polling or early resolution webhook.
         
@@ -392,7 +635,8 @@ class RemediationManager:
             alertmanager_check_delay_minutes: Minutes to wait before checking Alertmanager
         
         Returns:
-            True if alert resolved, False if timeout reached
+            (resolved, method) where ``method`` is one of
+            ``ResolutionSource.{WEBHOOK, POLLING, TIMEOUT}``.
         """
         check_interval = self.config.remediation.alert_check_interval_seconds
         max_wait = alertmanager_check_delay_minutes * 60
@@ -402,12 +646,12 @@ class RemediationManager:
             # Check if we received a resolved webhook
             if resolution_event.is_set():
                 logger.info(f"Early resolution via webhook for {workflow.id}")
-                return True
+                return True, ResolutionSource.WEBHOOK
             
             # Poll Alertmanager
             if await self._check_alert_resolved(workflow):
                 logger.info(f"Alert resolved (confirmed by polling) for {workflow.id}")
-                return True
+                return True, ResolutionSource.POLLING
             
             # Wait for next check interval or early resolution
             try:
@@ -417,11 +661,28 @@ class RemediationManager:
                 )
                 # Event was set - resolved via webhook
                 logger.info(f"Early resolution via webhook for {workflow.id}")
-                return True
+                return True, ResolutionSource.WEBHOOK
             except asyncio.TimeoutError:
                 elapsed += check_interval
         
-        return False  # Timeout - alert still firing
+        return False, ResolutionSource.TIMEOUT
+    
+    def _record_alert_resolution_wait(
+        self,
+        workflow: RemediationWorkflow,
+        method: str,
+    ) -> None:
+        """Observe the time spent waiting for the alert to clear after job success."""
+        if not workflow.job_completed_at:
+            return
+        try:
+            elapsed = (datetime.utcnow() - workflow.job_completed_at).total_seconds()
+            metrics.ALERT_RESOLUTION_WAIT.labels(
+                alert_type=workflow.alert_name,
+                method=method,
+            ).observe(max(elapsed, 0.0))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Failed to record alert resolution wait: {e}")
     
     async def handle_resolved_event(
         self, 
@@ -470,6 +731,7 @@ class RemediationManager:
                 
                 if is_complete:
                     workflow.job_completed_at = datetime.utcnow()
+                    self._record_job_execution_duration(workflow, status or "unknown")
                     
                     # Fetch JIRA ticket ID from execution options
                     options = await self.job_monitor.get_execution_options(
@@ -507,8 +769,25 @@ class RemediationManager:
         # Timeout
         workflow.update_state(RemediationState.JOB_FAILED, "Job execution timeout")
         await self.state_store.save(workflow)
+        self._record_job_execution_duration(workflow, "timeout")
         logger.warning(f"Job {workflow.rundeck_execution_id} timed out")
         return False
+    
+    def _record_job_execution_duration(
+        self,
+        workflow: RemediationWorkflow,
+        status: str,
+    ) -> None:
+        """Observe Rundeck job runtime (last trigger to terminal job status)."""
+        start = workflow.last_triggered_at or workflow.created_at
+        completed = workflow.job_completed_at or datetime.utcnow()
+        try:
+            metrics.JOB_EXECUTION_DURATION.labels(
+                alert_type=workflow.alert_name,
+                status=status,
+            ).observe(max((completed - start).total_seconds(), 0.0))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Failed to record job execution duration: {e}")
     
     async def _check_alert_resolved(self, workflow: RemediationWorkflow) -> bool:
         """
@@ -549,8 +828,8 @@ class RemediationManager:
         
         logger.info(f"Remediation successful for {workflow.alert_name}")
         
-        # Record success metric
-        self._record_outcome(workflow.alert_name, "success")
+        # Record terminal metrics (outcome counter + duration histogram)
+        self._record_terminal(workflow, RemediationOutcome.SUCCESS)
         
         # Update JIRA
         if self.jira_client and workflow.jira_ticket_id:
@@ -560,9 +839,17 @@ class RemediationManager:
                     workflow.alert_name,
                     workflow.rundeck_execution_url
                 )
-                self.record_circuit_success("jira")
+                metrics.JIRA_OPERATIONS.labels(
+                    operation=JiraOperation.ADD_REMEDIATION_SUCCESS_COMMENT,
+                    status="success",
+                ).inc()
+                self.record_circuit_success(ExternalService.JIRA)
             except Exception as e:
-                self.record_circuit_failure("jira")
+                metrics.JIRA_OPERATIONS.labels(
+                    operation=JiraOperation.ADD_REMEDIATION_SUCCESS_COMMENT,
+                    status="error",
+                ).inc()
+                self.record_circuit_failure(ExternalService.JIRA)
                 logger.error(f"Failed to update JIRA: {e}")
         
         workflow.update_state(RemediationState.COMPLETED)
@@ -580,8 +867,11 @@ class RemediationManager:
         
         logger.info(f"Job execution completed for {workflow.alert_name} (resolution check skipped)")
         
-        # Record success metric with specific outcome
-        self._record_outcome(workflow.alert_name, "job_success_no_resolution_check")
+        metrics.RESOLUTION_SOURCE.labels(
+            alert_type=workflow.alert_name,
+            source=ResolutionSource.SKIPPED,
+        ).inc()
+        self._record_terminal(workflow, RemediationOutcome.JOB_SUCCESS_NO_RESOLUTION_CHECK)
     
     async def _handle_alert_still_firing(self, workflow: RemediationWorkflow) -> bool:
         """
@@ -618,11 +908,18 @@ class RemediationManager:
             if options is None:
                 # If options are not available, we cannot retrigger reliably — escalate
                 logger.error(f"Cannot retrigger workflow {workflow.id} because rundeck_options are missing")
+                self._record_terminal(workflow, RemediationOutcome.MISSING_OPTIONS)
                 await self._escalate(workflow, "missing_rundeck_options_for_retrigger")
                 return False
 
+            new_attempt_number = (workflow.attempts or 0) + 1
+            metrics.REMEDIATION_RETRIES.labels(
+                alert_type=workflow.alert_name,
+                attempt_number=bucket_attempts(new_attempt_number),
+            ).inc()
+            
             try:
-                logger.info(f"Retriggering Rundeck job for workflow {workflow.id} (attempt {workflow.attempts + 1}/{max_attempts})")
+                logger.info(f"Retriggering Rundeck job for workflow {workflow.id} (attempt {new_attempt_number}/{max_attempts})")
                 res = await self.rundeck_client.run_job(alert_cfg.job_id, options)
                 new_exec_id = str(res.get("id", ""))
                 new_exec_url = res.get("permalink") or res.get("permalinkUrl") or res.get("url")
@@ -630,16 +927,26 @@ class RemediationManager:
                 # Update workflow with new job execution details and increment attempts
                 workflow.rundeck_execution_id = new_exec_id
                 workflow.rundeck_execution_url = new_exec_url
-                workflow.attempts = (workflow.attempts or 0) + 1
+                workflow.attempts = new_attempt_number
                 workflow.last_triggered_at = datetime.utcnow()
                 workflow.update_state(RemediationState.JOB_TRIGGERED)
                 await self.state_store.save(workflow)
+
+                # Keep the in-memory fallback in sync with the persisted
+                # attempt count. Without this, a state-store-down crash
+                # mid-retry would record ``attempts="1"`` for a workflow
+                # that was actually on attempt N, distorting the retry
+                # distribution histogram.
+                fallback = self._workflow_fallback.get(workflow.id)
+                if fallback is not None:
+                    fallback.attempts = new_attempt_number
 
                 logger.info(f"Retriggered remediation for workflow {workflow.id}, now attempts={workflow.attempts}")
                 return True
 
             except Exception as e:
                 logger.exception(f"Failed to retrigger job for workflow {workflow.id}: {e}")
+                self._record_terminal(workflow, RemediationOutcome.RETRIGGER_FAILED)
                 await self._escalate(workflow, f"retrigger_failed: {e}")
                 return False
 
@@ -647,6 +954,7 @@ class RemediationManager:
         logger.info(f"Max attempts reached for workflow {workflow.id} (attempts={workflow.attempts}/{max_attempts}), escalating")
         workflow.update_state(RemediationState.ESCALATED, error="max_attempts_reached")
         await self.state_store.save(workflow)
+        self._record_terminal(workflow, RemediationOutcome.ALERT_STILL_FIRING)
         await self._escalate(workflow, "alert still firing after max remediation attempts")
         return False
     
@@ -655,15 +963,21 @@ class RemediationManager:
         reason = workflow.error_message or "Rundeck job execution failed"
         logger.warning(f"Job failed for {workflow.alert_name}: {reason}")
         
-        # Record failure metric
-        self._record_outcome(workflow.alert_name, "job_failed")
+        self._record_terminal(workflow, RemediationOutcome.JOB_FAILED)
         
         await self._escalate(workflow, reason)
     
     async def _escalate(self, workflow: RemediationWorkflow, reason: str) -> None:
         """Escalate to JIRA and Slack."""
+        target = self._resolve_escalation_target(workflow)
+        slack_status = "sent"
         # Add JIRA comment
         if self.jira_client and workflow.jira_ticket_id:
+            jira_op = (
+                JiraOperation.ADD_JOB_FAILURE_COMMENT
+                if workflow.state == RemediationState.JOB_FAILED
+                else JiraOperation.ADD_REMEDIATION_FAILURE_COMMENT
+            )
             try:
                 if workflow.state == RemediationState.JOB_FAILED:
                     await self.jira_client.add_job_failure_comment(
@@ -679,7 +993,9 @@ class RemediationManager:
                         reason,
                         workflow.rundeck_execution_url
                     )
+                metrics.JIRA_OPERATIONS.labels(operation=jira_op, status="success").inc()
             except Exception as e:
+                metrics.JIRA_OPERATIONS.labels(operation=jira_op, status="error").inc()
                 logger.error(f"Failed to update JIRA: {e}")
         
         # Send Slack escalation
@@ -697,11 +1013,36 @@ class RemediationManager:
                     jira_url=jira_url,
                     rundeck_url=workflow.rundeck_execution_url
                 )
+                metrics.SLACK_NOTIFICATIONS.labels(
+                    type=SlackNotificationType.ESCALATION, status="success"
+                ).inc()
             except Exception as e:
+                slack_status = "failed"
+                metrics.SLACK_NOTIFICATIONS.labels(
+                    type=SlackNotificationType.ESCALATION, status="error"
+                ).inc()
                 logger.error(f"Failed to send Slack escalation: {e}")
+        
+        metrics.ESCALATIONS_SENT.labels(
+            alert_type=workflow.alert_name,
+            target=target,
+            result=slack_status,
+        ).inc()
         
         workflow.update_state(RemediationState.ESCALATED)
         await self.state_store.save(workflow)
+    
+    def _resolve_escalation_target(self, workflow: RemediationWorkflow) -> str:
+        """
+        Resolve the escalation target label for metrics.
+        
+        Today this is always the global NOC channel/user-group; once
+        per-alert ``escalation_target`` lands in ``AlertConfig`` we'll plumb
+        it through here so dashboards can answer "to which team?".
+        """
+        if self.slack_client and self.slack_client.noc_user_group:
+            return self.slack_client.noc_user_group
+        return DEFAULT_ESCALATION_TARGET
     
     async def get_workflow_status(self, workflow_id: str) -> Optional[Dict[str, Any]]:
         """Get the current status of a workflow."""
@@ -758,6 +1099,9 @@ class RemediationManager:
                     logger.warning(f"Skipping stale workflow {workflow.id} (age: {age_hours:.1f}h)")
                     workflow.update_state(RemediationState.ESCALATED, "Workflow stale after restart")
                     await self.state_store.save(workflow)
+                    metrics.WORKFLOW_RECOVERY.labels(
+                        outcome=WorkflowRecoveryOutcome.STALE_SKIPPED
+                    ).inc()
                     continue
                 
                 # Re-populate cooldown tracking
@@ -779,43 +1123,60 @@ class RemediationManager:
                     # Create resolution event
                     resolution_event = asyncio.Event()
                     self._resolution_events[workflow.id] = resolution_event
-                    
+
+                    # Stash fallback metadata for the outer exception handler
+                    # in ``_monitor_workflow`` (see ``_WorkflowFallback``).
+                    # Recovered workflows may already be on attempt N, so
+                    # carry that forward instead of resetting to 1.
+                    self._workflow_fallback[workflow.id] = _WorkflowFallback(
+                        alert_name=workflow.alert_name,
+                        created_at=workflow.created_at,
+                        attempts=workflow.attempts or 1,
+                    )
+
                     # Start monitoring task
                     task = asyncio.create_task(self._resume_workflow(workflow))
                     self._running_tasks[workflow.id] = task
                     recovered += 1
+                    metrics.WORKFLOW_RECOVERY.labels(
+                        outcome=WorkflowRecoveryOutcome.RECOVERED
+                    ).inc()
                 else:
                     logger.info(f"Workflow {workflow.id} in terminal state {workflow.state.value}, skipping recovery")
+                    metrics.WORKFLOW_RECOVERY.labels(
+                        outcome=WorkflowRecoveryOutcome.TERMINAL_SKIPPED
+                    ).inc()
             
+            self._refresh_active_workflows_gauge()
             return recovered
             
         except Exception as e:
             logger.error(f"Error recovering workflows: {e}")
+            metrics.WORKFLOW_RECOVERY.labels(
+                outcome=WorkflowRecoveryOutcome.FAILED
+            ).inc()
             return recovered
     
     async def _resume_workflow(self, workflow: RemediationWorkflow) -> None:
         """
-        Resume monitoring a recovered workflow based on its current state.
+        Resume monitoring a recovered workflow.
+
+        Thin wrapper around :meth:`_monitor_workflow`. ``_monitor_workflow``
+        owns the workflow's full lifecycle: it sets up the resolution event,
+        runs the monitor loop, and has a hardened outer ``try/except/finally``
+        that swallows cancellations, records the fallback ``escalated``
+        terminal metric (idempotently, see :meth:`_record_terminal`), and
+        cleans up ``_running_tasks`` / ``_resolution_events`` / the terminal
+        sentinel.
+
+        This wrapper deliberately does **not** repeat any of that. Earlier
+        revisions had their own ``except`` / ``finally`` here, but they were
+        either dead (``_monitor_workflow`` already handles every exception
+        without propagating) or actively buggy (the discarded
+        ``_terminal_recorded`` sentinel meant a re-entry through here would
+        record a second ``escalated`` sample for the same workflow).
         """
-        resolution_event = self._resolution_events.get(workflow.id)
-        if not resolution_event:
-            resolution_event = asyncio.Event()
-            self._resolution_events[workflow.id] = resolution_event
-            
-        try:
-            # Resume monitor as loop by directly turning this into a while True loop or calling the _monitor_workflow method
-            # Actually, _monitor_workflow method is already a while True loop!
-            # We can just jump directly into the _monitor_workflow method
-            await self._monitor_workflow(workflow.id)
-        except asyncio.CancelledError:
-            logger.info(f"Recovered workflow {workflow.id} monitoring cancelled")
-        except Exception as e:
-            logger.exception(f"Error in recovered workflow {workflow.id}: {e}")
-            workflow.update_state(RemediationState.ESCALATED, str(e))
-            await self.state_store.save(workflow)
-        finally:
-            self._running_tasks.pop(workflow.id, None)
-            self._resolution_events.pop(workflow.id, None)
+        await self._monitor_workflow(workflow.id)
     
     async def shutdown(self) -> None:
         """Cancel all running workflow monitors."""
@@ -826,4 +1187,5 @@ class RemediationManager:
             await asyncio.gather(*self._running_tasks.values(), return_exceptions=True)
         
         self._running_tasks.clear()
+        self._refresh_active_workflows_gauge()
         logger.info("RemediationManager shutdown complete")

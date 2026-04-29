@@ -14,15 +14,29 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, status, Response, Header, Depends
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from pydantic import BaseModel, Field
 
+import hermes
 from hermes.config import load_alert_config, Config
 from hermes.core.state_store import InMemoryStateStore, DynamoDBStateStore
 from hermes.core.remediation_manager import RemediationManager
 from hermes.clients.rundeck import RundeckClient
 from hermes.clients.jira import JiraClient
 from hermes.utils.audit_logger import get_audit_logger
+from hermes.utils.metrics import (
+    ALERTS_DEDUPLICATED,
+    ALERTS_RECEIVED_BY_TYPE,
+    CIRCUIT_BREAKER_TRIPS,
+    INCOMING_REQUESTS,
+    JIRA_TICKET_FETCH,
+    PROCESSING_DURATION,
+    PROCESSING_ERRORS,
+    RATE_LIMITED_REQUESTS,
+    REMEDIATION_WORKFLOWS,
+    RUNDECK_JOB_TRIGGERS,
+    set_build_info,
+)
 from hermes.utils.rate_limiter import RateLimiter
 
 
@@ -41,69 +55,6 @@ logger = logging.getLogger(__name__)
 
 # Apply health check filter to uvicorn access logger
 logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
-
-# Prometheus Metrics
-INCOMING_REQUESTS = Counter(
-    "hermes_incoming_requests_total",
-    "The total number of incoming alert requests"
-)
-WEBHOOK_REQUESTS = Counter(
-    "hermes_webhook_requests_total",
-    "The total number of webhook requests sent"
-)
-WEBHOOK_ERRORS = Counter(
-    "hermes_webhook_errors_total",
-    "The total number of webhook request errors"
-)
-PROCESSING_DURATION = Histogram(
-    "hermes_processing_duration_seconds",
-    "The time taken to process alert requests"
-)
-ALERTS_RECEIVED_BY_TYPE = Counter(
-    "hermes_alerts_received_total",
-    "The total number of alerts received by type",
-    ["alert_type"]
-)
-PROCESSING_ERRORS = Counter(
-    "hermes_processing_errors_total",
-    "The total number of errors during alert processing",
-    ["error_type", "alert_type"]
-)
-RUNDECK_JOB_TRIGGERS = Counter(
-    "hermes_rundeck_job_triggers_total",
-    "The total number of Rundeck job triggers",
-    ["alert_type", "status"]
-)
-REMEDIATION_WORKFLOWS = Counter(
-    "hermes_remediation_workflows_total",
-    "The total number of remediation workflows started",
-    ["alert_type"]
-)
-ALERTS_DEDUPLICATED = Counter(
-    "hermes_alerts_deduplicated_total",
-    "The total number of alerts skipped due to deduplication",
-    ["alert_type", "reason"]
-)
-CIRCUIT_BREAKER_TRIPS = Counter(
-    "hermes_circuit_breaker_trips_total",
-    "The total number of circuit breaker trips",
-    ["service"]
-)
-REMEDIATION_OUTCOMES = Counter(
-    "hermes_remediation_outcomes_total",
-    "The total number of remediation outcomes by result",
-    ["alert_type", "outcome"]
-)
-RATE_LIMITED_REQUESTS = Counter(
-    "hermes_rate_limited_requests_total",
-    "The total number of rate limited requests",
-    ["source", "limit_type"]
-)
-JIRA_TICKET_FETCH = Counter(
-    "hermes_jira_ticket_fetch_total",
-    "The total number of JIRA ticket fetch attempts",
-    ["alert_type", "status"]
-)
 
 CONFIG_PATH = os.getenv("CONFIG_PATH", "config/config.yaml")
 try:
@@ -143,16 +94,10 @@ if app_config and app_config.jira:
     logger.info("JIRA client initialized for ticket lookups")
 
 
-def record_remediation_outcome(alert_name: str, outcome: str):
-    """Callback to record remediation outcomes in Prometheus metrics."""
-    REMEDIATION_OUTCOMES.labels(alert_type=alert_name, outcome=outcome).inc()
-
-
 remediation_manager = RemediationManager(
-    app_config, 
-    state_store, 
+    app_config,
+    state_store,
     rundeck_client,
-    metrics_callback=record_remediation_outcome
 ) if app_config and rundeck_client else None
 
 #TODO: this needs to be adjusted
@@ -173,6 +118,12 @@ async def lifespan(app: FastAPI):
     """Manage application lifecycle."""
     logger.info("Hermes starting up...")
     
+    set_build_info(
+        version=getattr(hermes, "__version__", "unknown"),
+        commit=os.getenv("HERMES_GIT_SHA", "unknown"),
+        config_hash=_compute_config_hash(),
+    )
+    
     # Recover active workflows from state store on startup
     if remediation_manager:
         try:
@@ -187,6 +138,16 @@ async def lifespan(app: FastAPI):
     logger.info("Hermes shutting down...")
     if remediation_manager:
         await remediation_manager.shutdown()
+
+
+def _compute_config_hash() -> str:
+    """Hash the loaded config file so build_info reflects the running config."""
+    try:
+        import hashlib
+        with open(CONFIG_PATH, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except Exception:  # noqa: BLE001 - best-effort metadata
+        return "unknown"
 
 
 def extract_alertmanager_url(client_url: Optional[str]) -> Optional[str]:
@@ -283,11 +244,24 @@ class AlertPayload(BaseModel):
 class AlertProcessor:
     """Processes incoming alerts and triggers Rundeck jobs."""
     
-    def __init__(self, config: Config, rundeck: RundeckClient, jira: Optional[JiraClient] = None, remediation_manager: Optional[RemediationManager] = None):
+    def __init__(self, config: Config, rundeck: RundeckClient, jira: Optional[JiraClient] = None):
+        """
+        Triggers Rundeck jobs for incoming alerts.
+
+        ``AlertProcessor`` deliberately does **not** hold a reference to the
+        ``RemediationManager``. The remediation lifecycle (dedup gate,
+        ``start_remediation`` call, ``REMEDIATION_WORKFLOWS`` increment, audit
+        log, response shaping) is owned end-to-end by the HTTP handlers
+        (``receive_alert`` / ``receive_public_webhook``). Earlier revisions
+        also kicked off ``start_remediation`` from inside ``send_to_webhook``,
+        which combined with the outer call to silently create two workflows,
+        two monitor tasks, and double every workflow lifecycle metric per
+        alert. Keep this constructor remediation-free so that drift cannot
+        reintroduce that bug.
+        """
         self.config = config
         self.rundeck = rundeck
         self.jira = jira
-        self.remediation_manager = remediation_manager
 
     def generate_split_payloads(
         self, 
@@ -569,22 +543,14 @@ class AlertProcessor:
             RUNDECK_JOB_TRIGGERS.labels(alert_type=alert_name, status="triggered").inc()
             logger.info(f"Triggered Rundeck job {resolved_job_id} -> execution {exec_id}")
 
-            # If we have a remediation manager available, start the workflow and pass options
-            if self.remediation_manager:
-                # Extract alert labels for matching; reuse your existing logic to derive labels
-                alert_labels_for_match = full_alert_context.get("alert_labels", {}) if full_alert_context else payload.get("alert_labels", {})
-
-                # Start the remediation workflow with rundeck options
-                workflow_id = await self.remediation_manager.start_remediation(
-                    alert_name=alert_name,
-                    alert_labels=alert_labels_for_match,
-                    rundeck_execution_id=exec_id,
-                    rundeck_execution_url=exec_url,
-                    alertmanager_url=extract_alertmanager_url(full_alert_context.get("source_alertmanager") if full_alert_context else None),
-                    rundeck_options=payload
-                )
-                logger.info(f"Started remediation workflow {workflow_id} for alert {alert_name}")
-
+            # Intentionally do NOT call remediation_manager.start_remediation here.
+            # The HTTP handlers (receive_alert / receive_public_webhook) own the
+            # remediation lifecycle for the request: they run the dedup gate,
+            # call start_remediation exactly once on success, bump
+            # REMEDIATION_WORKFLOWS, write the audit log, and shape the
+            # response. Starting it here as well silently created a second
+            # workflow row + monitor task per alert and doubled every
+            # downstream workflow metric.
             return {
                 "status": "triggered",
                 "execution_id": exec_id,
@@ -651,18 +617,52 @@ class AlertProcessor:
         raise ValueError(message)
 
 
-processor = AlertProcessor(app_config, rundeck_client, jira_client, remediation_manager) if app_config and rundeck_client else None
+processor = AlertProcessor(app_config, rundeck_client, jira_client) if app_config and rundeck_client else None
+
+
+_TRACKED_ENDPOINTS = {
+    "/api/v1/alerts": "alerts",
+    "/api/v1/webhooks/public": "public_webhook",
+}
+
+
+def _classify_dedup_reason(skip_reason: Optional[str], existing_workflow_id: Optional[str]) -> str:
+    """Map the free-form skip reason from the manager to a closed-set label.
+
+    Order matters: ``RemediationManager.check_deduplication`` populates the
+    ``existing_workflow_id`` tuple element on *both* the active-workflow and
+    the cooldown branches (the cooldown branch returns the previous workflow
+    id). Branching on ``existing_workflow_id`` first would therefore label
+    every cooldown skip as ``active_workflow`` and conflate concurrency with
+    flapping. Inspect the reason text first and use ``existing_workflow_id``
+    only as a fallback when no reason was provided.
+    """
+    reason_lc = skip_reason.lower() if skip_reason else ""
+    if "cooldown" in reason_lc:
+        return "cooldown"
+    if "max concurrent" in reason_lc:
+        return "concurrency_limit"
+    if "active workflow" in reason_lc:
+        return "active_workflow"
+    if existing_workflow_id:
+        return "active_workflow"
+    return "other"
 
 
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
-    if request.url.path == "/api/v1/alerts":
-        start_time = time.time()
-        response = await call_next(request)
-        process_time = time.time() - start_time
-        PROCESSING_DURATION.observe(process_time)
-        return response
-    return await call_next(request)
+    endpoint = _TRACKED_ENDPOINTS.get(request.url.path)
+    if endpoint is None:
+        return await call_next(request)
+    
+    start_time = time.time()
+    response = await call_next(request)
+    PROCESSING_DURATION.labels(endpoint=endpoint).observe(time.time() - start_time)
+    INCOMING_REQUESTS.labels(
+        endpoint=endpoint,
+        status=str(response.status_code),
+    ).inc()
+    return response
 
 
 @app.get("/metrics")
@@ -737,8 +737,6 @@ async def health_live():
 
 @app.post("/api/v1/alerts")
 async def receive_alert(request: Request):
-    INCOMING_REQUESTS.inc()
-    
     if not processor:
         raise HTTPException(status_code=500, detail="Configuration not loaded")
 
@@ -857,7 +855,7 @@ async def receive_alert(request: Request):
                 alert_name, labels, alert_cooldown_override=alert_cooldown
             )
             if should_skip:
-                reason_label = "active_workflow" if existing_workflow_id else "cooldown_or_limit"
+                reason_label = _classify_dedup_reason(skip_reason, existing_workflow_id)
                 ALERTS_DEDUPLICATED.labels(alert_type=alert_name, reason=reason_label).inc()
                 logger.info(f"Alert '{alert_name}' deduplicated: {skip_reason}")
                 audit_logger.log_alert_deduplicated(alert_name, labels, skip_reason, existing_workflow_id)
@@ -941,8 +939,6 @@ async def receive_public_webhook(
     Accepts standard Alertmanager-formatted payloads.
     """
     # Use the same logic as /api/v1/alerts but with authentication
-    INCOMING_REQUESTS.inc()
-    
     if not processor:
         raise HTTPException(status_code=500, detail="Configuration not loaded")
 
@@ -1061,7 +1057,7 @@ async def receive_public_webhook(
                 alert_name, labels, alert_cooldown_override=alert_cooldown
             )
             if should_skip:
-                reason_label = "active_workflow" if existing_workflow_id else "cooldown_or_limit"
+                reason_label = _classify_dedup_reason(skip_reason, existing_workflow_id)
                 ALERTS_DEDUPLICATED.labels(alert_type=alert_name, reason=reason_label).inc()
                 logger.info(f"[Public] Alert '{alert_name}' deduplicated: {skip_reason}")
                 audit_logger.log_alert_deduplicated(alert_name, labels, skip_reason, existing_workflow_id)
