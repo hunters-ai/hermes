@@ -12,7 +12,8 @@ This is the core orchestration component that:
 import asyncio
 import logging
 import uuid
-from typing import Dict, Any, Optional, Set, Tuple
+from collections import deque
+from typing import Deque, Dict, Any, Optional, Set, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 
@@ -25,6 +26,7 @@ from hermes.clients.jira import JiraClient
 from hermes.clients.slack import SlackClient
 from hermes.utils import metrics
 from hermes.utils.metrics import (
+    BurstSuppressionPhase,
     ExternalService,
     JiraOperation,
     RemediationOutcome,
@@ -207,7 +209,27 @@ class RemediationManager:
         
         # Rate limiting per Alertmanager source
         self._rate_limiters: Dict[str, Any] = {}
-        
+
+        # Burst suppression state — all in-memory, per-pod, lost on restart.
+        # _burst_window: timestamps of recent successful start_remediation
+        #   calls for each `alert_name`. Old entries are pruned lazily inside
+        #   `check_burst_suppression` / `record_burst_fire`. The deque is
+        #   not bounded by maxlen because the bound is *time*, not count;
+        #   bounding by count would let a slow steady stream hide a fast burst.
+        # `_suppressed_until`: when an alert_name transitions to suppressed,
+        #   we stash the auto-lift time here. A missing entry => not suppressed.
+        # `_suppression_notified_at`: tracks the last time we paged Slack for
+        #   a given alert_name so we don't repage on every dropped alert during
+        #   the same suppression cycle. Cleared on auto-lift / dismiss.
+        # The deployment is single-pod today; if it scales out, K_effective
+        # grows linearly with pod count because these dicts are not shared
+        # across replicas. Same trade-off as the existing circuit breakers
+        # and cooldowns. Revisit (state-store-backed counters) before
+        # scaling beyond ~2 pods.
+        self._burst_window: Dict[str, Deque[datetime]] = {}
+        self._suppressed_until: Dict[str, datetime] = {}
+        self._suppression_notified_at: Dict[str, datetime] = {}
+
         metrics.set_active_workflow_count(0)
     
     def _get_alert_fingerprint(self, alert_name: str, alert_labels: Dict[str, str]) -> str:
@@ -304,6 +326,162 @@ class RemediationManager:
                 metrics.CIRCUIT_BREAKER_TRIPS.labels(service=service).inc()
                 metrics.set_circuit_breaker_state(service, True)
                 logger.warning(f"Circuit breaker OPENED for {service} after {cb.failures} failures")
+
+    # ------------------------------------------------------------------
+    # Burst suppression
+    # ------------------------------------------------------------------
+    def check_burst_suppression(
+        self,
+        alert_name: str,
+        threshold: int,
+        window_minutes: int,
+        suppression_minutes: int,
+    ) -> Tuple[bool, Optional[str], Optional[str], int]:
+        """
+        Decide whether the next workflow for `alert_name` should be suppressed.
+
+        Pure read on the suppression flag, but it *will* mutate two pieces
+        of state:
+
+        - Prunes `_burst_window[alert_name]` (drops timestamps older than
+          `now - window_minutes`) so the count reflects only the window.
+        - On the transition into the suppressed state, sets
+          `_suppressed_until[alert_name]` so subsequent calls short-circuit.
+
+        The caller is responsible for calling `record_burst_fire`
+        *after* `start_remediation` succeeds — never inside this method,
+        because a transient failure between "decided to allow" and "started
+        workflow" must not inflate the counter.
+
+        Args:
+            alert_name: closed-set key (bounded by `config.yaml`).
+            threshold: per-alert K (see `BurstSuppressionConfig`).
+            window_minutes: per-alert N.
+            suppression_minutes: how long suppression stays active on trip.
+
+        Returns:
+            `(should_suppress, reason, transition, fires_in_window)` where:
+              - `transition == "tripped"` exactly once per suppression
+                cycle, when this call moves the alert into suppression.
+                The caller should send the Slack page in this case.
+              - `transition == "dropped"` for any alert dropped while
+                suppression was already active.
+              - `transition is None` when `should_suppress` is False.
+              - `fires_in_window` is the (post-prune) count of fires in
+                the current rolling window. For the `dropped` branch this
+                is the count as of the original trip (the window is frozen
+                because suppressed alerts do not call `record_burst_fire`).
+        """
+        now = datetime.utcnow()
+
+        # Fast path: already suppressed.
+        suppressed_until = self._suppressed_until.get(alert_name)
+        if suppressed_until is not None and now < suppressed_until:
+            frozen_count = len(self._burst_window.get(alert_name, ()))
+            return (
+                True,
+                f"Burst suppression active until {suppressed_until.isoformat()}Z",
+                BurstSuppressionPhase.DROPPED,
+                frozen_count,
+            )
+        # Stale entry whose suppression window already expired — clear it
+        # so the deactivation gauge reflects reality and a future trip can re-page Slack.
+        if suppressed_until is not None:
+            self._suppressed_until.pop(alert_name, None)
+            self._suppression_notified_at.pop(alert_name, None)
+            metrics.BURST_SUPPRESSION_ACTIVE.labels(alert_type=alert_name).set(0)
+
+        # Prune the window before counting.
+        window = self._burst_window.get(alert_name)
+        if window is not None:
+            cutoff = now - timedelta(minutes=window_minutes)
+            while window and window[0] < cutoff:
+                window.popleft()
+            if not window:
+                # Drop the empty deque so memory doesn't accumulate for
+                # one-shot alert names that never reach the threshold again.
+                self._burst_window.pop(alert_name, None)
+                window = None
+
+        count = len(window) if window is not None else 0
+
+        if count >= threshold:
+            suppressed_until = now + timedelta(minutes=suppression_minutes)
+            self._suppressed_until[alert_name] = suppressed_until
+            metrics.BURST_SUPPRESSION_ACTIVE.labels(alert_type=alert_name).set(1)
+            logger.warning(
+                f"Burst suppression TRIPPED for alert_name={alert_name}: "
+                f"{count} fires in {window_minutes}m >= threshold {threshold}; "
+                f"suppressed until {suppressed_until.isoformat()}Z"
+            )
+            return (
+                True,
+                (
+                    f"Burst threshold exceeded: {count} fires in "
+                    f"{window_minutes}m (threshold={threshold})"
+                ),
+                BurstSuppressionPhase.TRIPPED,
+                count,
+            )
+
+        return (False, None, None, count)
+
+    def record_burst_fire(self, alert_name: str) -> None:
+        """
+        Record that a workflow was successfully started for `alert_name`.
+
+        Must be called from the endpoint after `start_remediation` returns
+        a workflow id, *not* from inside `check_burst_suppression`,
+        so that a trigger that ultimately fails (e.g. Rundeck error after
+        the check passed) doesn't inflate the counter. The trade-off is the
+        small race window where two concurrent webhooks both pass the
+        check before either records — that's the "okay to trigger a few
+        more" allowance documented in the design.
+
+        Suppressed alerts must not call this method — the endpoint already
+        short-circuits before reaching `start_remediation`.
+        """
+        window = self._burst_window.get(alert_name)
+        if window is None:
+            window = deque()
+            self._burst_window[alert_name] = window
+        window.append(datetime.utcnow())
+
+    def clear_burst_suppression(self, alert_name: str) -> bool:
+        """
+        Operator-initiated dismiss of an active burst suppression.
+
+        Clears the suppression flag, the rolling window, and the
+        notification de-dupe state. The next K fires will trip suppression
+        again, which is intentional — dismissing doesn't whitelist the
+        alert name, it just lifts the current pause so the operator can
+        observe the next K fires from scratch.
+
+        Returns `True` if the alert was actually suppressed, `False` if
+        there was nothing to clear (so the endpoint can return 404).
+        """
+        was_suppressed = alert_name in self._suppressed_until
+        self._suppressed_until.pop(alert_name, None)
+        self._burst_window.pop(alert_name, None)
+        self._suppression_notified_at.pop(alert_name, None)
+        metrics.BURST_SUPPRESSION_ACTIVE.labels(alert_type=alert_name).set(0)
+        if was_suppressed:
+            logger.info(f"Burst suppression DISMISSED for alert_name={alert_name}")
+        return was_suppressed
+
+    def mark_burst_notified(self, alert_name: str) -> bool:
+        """
+        De-dupe gate for the one-shot Slack page on suppression trip.
+
+        Returns `True` if this is the first call for the current
+        suppression cycle (caller should fire the Slack page); `False` if
+        we've already paged for this cycle. Idempotent so the endpoint can
+        call it without checking `_suppression_notified_at` directly.
+        """
+        if alert_name in self._suppression_notified_at:
+            return False
+        self._suppression_notified_at[alert_name] = datetime.utcnow()
+        return True
     
     def _record_outcome(
         self,

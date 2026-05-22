@@ -9,6 +9,27 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
+class BurstSuppressionConfig(BaseModel):
+    """Per-alert burst-suppression configuration.
+
+    Detects a spike of distinct fingerprints for the same ``alert_name``
+    (e.g. one Snowpipe alert per dataflow during an infra-wide event) and
+    suppresses further Rundeck triggering for that alert name until the
+    suppression window expires or an operator dismisses it via
+    ``POST /api/v1/admin/burst-suppression/{alert_name}/dismiss``.
+
+    Counters and the suppression flag are in-memory only (per pod, lost on
+    restart). The deployment is single-pod today; if it scales out, the
+    effective threshold becomes ``threshold * pod_count`` because each pod
+    counts independently. See ``RemediationManager`` for the rationale.
+    """
+
+    enabled: bool = Field(default=False, description="Enable burst suppression for this alert")
+    threshold: int = Field(default=5, ge=1, description="K: trip when this many fires occur in the window")
+    window_minutes: int = Field(default=10, ge=1, description="N: rolling window length in minutes")
+    suppression_minutes: int = Field(default=30, ge=1, description="How long suppression stays active after trip")
+
+
 class AlertRemediationConfig(BaseModel):
     """Per-alert remediation configuration."""
     enabled: bool = Field(default=True)
@@ -27,6 +48,11 @@ class AlertRemediationConfig(BaseModel):
     alert_payload_option_name: str = Field(default="alert_payload", description="Rundeck option name for alert payload JSON")
     # Static options - always sent to Rundeck job regardless of alert payload
     static_options: Dict[str, str] = Field(default_factory=dict, description="Static key-value pairs always passed to Rundeck job options")
+    # Burst suppression - stop triggering Rundeck when many fingerprints fire for this alert in a short window
+    burst_suppression: BurstSuppressionConfig = Field(
+        default_factory=BurstSuppressionConfig,
+        description="Detect infra-wide spikes and pause per-fingerprint remediation"
+    )
 
 
 class AlertConfig(BaseModel):
