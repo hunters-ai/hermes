@@ -3,10 +3,12 @@ Hermes FastAPI Application.
 
 Main application entry point with all API routes and middleware.
 """
+import asyncio
 import logging
 import os
 import time
 import json
+from datetime import datetime
 from urllib.parse import urlparse, urlunparse
 from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
@@ -27,6 +29,8 @@ from hermes.utils.audit_logger import get_audit_logger
 from hermes.utils.metrics import (
     ALERTS_DEDUPLICATED,
     ALERTS_RECEIVED_BY_TYPE,
+    BURST_SUPPRESSIONS,
+    BurstSuppressionPhase,
     CIRCUIT_BREAKER_TRIPS,
     INCOMING_REQUESTS,
     JIRA_TICKET_FETCH,
@@ -35,6 +39,8 @@ from hermes.utils.metrics import (
     RATE_LIMITED_REQUESTS,
     REMEDIATION_WORKFLOWS,
     RUNDECK_JOB_TRIGGERS,
+    SLACK_NOTIFICATIONS,
+    SlackNotificationType,
     set_build_info,
 )
 from hermes.utils.rate_limiter import RateLimiter
@@ -626,6 +632,145 @@ _TRACKED_ENDPOINTS = {
 }
 
 
+async def _decide_suppress_burst(
+    alert_name: str,
+    alert_labels: Dict[str, str],
+    log_prefix: str = "",
+) -> Optional[JSONResponse]:
+    """
+    Burst-suppression gate shared by the firing-alert endpoints.
+
+    Returns a ready-to-send JSONResponse if the incoming alert should be
+    short-circuited because suppression is active (either freshly tripped
+    or already active). Returns None to let the caller continue with
+    the normal dedup / split / start-remediation pipeline.
+
+    Side effects on a tripped transition (exactly once per cycle):
+      - increments BURST_SUPPRESSIONS{phase="tripped"}
+      - audits burst_suppression_tripped
+      - fires a Slack page (fire-and-forget; failures are logged but
+        never block the suppression decision).
+    On every dropped (subsequent alert during active suppression):
+      - increments BURST_SUPPRESSIONS{phase="dropped"}
+      - audits burst_suppression_dropped.
+
+    The HTTP status code is 200 with status="suppressed" so Alertmanager
+    treats the webhook as accepted and does not retry — repeated retries
+    during a suppression are pure waste. The dropped alert will fire again
+    naturally on the next Alertmanager evaluation interval if it's still
+    active when suppression lifts.
+    """
+    if not remediation_manager or not app_config:
+        return None
+
+    alert_config = app_config.get_alert_config(alert_name)
+    if not alert_config:
+        return None
+
+    burst_cfg = alert_config.remediation.burst_suppression
+    if not burst_cfg or not burst_cfg.enabled:
+        return None
+
+    should_suppress, reason, transition, fires_in_window = (
+        remediation_manager.check_burst_suppression(
+            alert_name,
+            threshold=burst_cfg.threshold,
+            window_minutes=burst_cfg.window_minutes,
+            suppression_minutes=burst_cfg.suppression_minutes,
+        )
+    )
+    if not should_suppress:
+        return None
+
+    audit_logger = get_audit_logger()
+    suppressed_until = remediation_manager._suppressed_until.get(alert_name)
+    suppressed_until_str = suppressed_until.isoformat() + "Z" if suppressed_until else ""
+
+    if transition == BurstSuppressionPhase.TRIPPED:
+        BURST_SUPPRESSIONS.labels(
+            alert_type=alert_name, phase=BurstSuppressionPhase.TRIPPED
+        ).inc()
+        audit_logger.log_burst_suppression_tripped(
+            alert_name=alert_name,
+            threshold=burst_cfg.threshold,
+            window_minutes=burst_cfg.window_minutes,
+            suppression_minutes=burst_cfg.suppression_minutes,
+            fires_in_window=fires_in_window,
+            suppressed_until=suppressed_until_str,
+        )
+        if remediation_manager.mark_burst_notified(alert_name):
+            slack_client = remediation_manager.slack_client
+            if slack_client:
+                # Fire-and-forget so a slow Slack call never holds up the
+                # webhook response. Errors are recorded via track_call.
+                asyncio.create_task(
+                    _send_burst_suppression_slack(
+                        slack_client,
+                        alert_name=alert_name,
+                        threshold=burst_cfg.threshold,
+                        window_minutes=burst_cfg.window_minutes,
+                        suppression_minutes=burst_cfg.suppression_minutes,
+                        fires_in_window=fires_in_window,
+                        suppressed_until=suppressed_until_str,
+                    )
+                )
+        logger.warning(
+            f"{log_prefix}Burst suppression TRIPPED for '{alert_name}': {reason}"
+        )
+    else:
+        BURST_SUPPRESSIONS.labels(
+            alert_type=alert_name, phase=BurstSuppressionPhase.DROPPED
+        ).inc()
+        audit_logger.log_burst_suppression_dropped(
+            alert_name=alert_name,
+            alert_labels=alert_labels,
+            suppressed_until=suppressed_until_str,
+        )
+        logger.info(
+            f"{log_prefix}Alert '{alert_name}' dropped due to active burst suppression"
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "suppressed",
+            "reason": reason,
+            "alert_name": alert_name,
+            "suppressed_until": suppressed_until_str,
+        },
+    )
+
+
+async def _send_burst_suppression_slack(
+    slack_client,
+    *,
+    alert_name: str,
+    threshold: int,
+    window_minutes: int,
+    suppression_minutes: int,
+    fires_in_window: int,
+    suppressed_until: str,
+) -> None:
+    """Fire-and-forget Slack page on a burst-suppression trip."""
+    try:
+        await slack_client.send_burst_suppression_notification(
+            alert_name=alert_name,
+            threshold=threshold,
+            window_minutes=window_minutes,
+            suppression_minutes=suppression_minutes,
+            fires_in_window=fires_in_window,
+            suppressed_until=suppressed_until,
+        )
+        SLACK_NOTIFICATIONS.labels(
+            type=SlackNotificationType.BURST_SUPPRESSION, status="success"
+        ).inc()
+    except Exception as e:
+        SLACK_NOTIFICATIONS.labels(
+            type=SlackNotificationType.BURST_SUPPRESSION, status="error"
+        ).inc()
+        logger.error(f"Failed to send burst-suppression Slack notification: {e}")
+
+
 def _classify_dedup_reason(skip_reason: Optional[str], existing_workflow_id: Optional[str]) -> str:
     """Map the free-form skip reason from the manager to a closed-set label.
 
@@ -838,6 +983,13 @@ async def receive_alert(request: Request):
                 }
             )
 
+    # Burst-suppression gate (per-alert opt-in). When an infra-wide event causes
+    # many distinct fingerprints to fire in a short window, short-circuit the
+    # whole webhook before any Rundeck work. Slack page is sent once per trip.
+    burst_response = await _decide_suppress_burst(alert_name, alert_labels)
+    if burst_response is not None:
+        return burst_response
+
     # Generate split payloads if split_field is configured
     split_payloads = processor.generate_split_payloads(alert_name, processed_alert, alert_labels)
     
@@ -901,6 +1053,11 @@ async def receive_alert(request: Request):
                     rundeck_options=payload
                 )
                 REMEDIATION_WORKFLOWS.labels(alert_type=alert_name).inc()
+                # Record the fire for burst suppression *only after* the workflow
+                # started successfully — see ``record_burst_fire`` docstring for
+                # why we deliberately don't increment on dedup-skips or
+                # Rundeck-trigger failures.
+                remediation_manager.record_burst_fire(alert_name)
                 logger.info(f"Started remediation workflow: {workflow_id} (AM: {alertmanager_url})")
                 audit_logger.log_workflow_started(
                     workflow_id, alert_name, labels,
@@ -1040,6 +1197,11 @@ async def receive_public_webhook(
                 }
             )
 
+    # Burst-suppression gate — same semantics as the internal endpoint above.
+    burst_response = await _decide_suppress_burst(alert_name, alert_labels, log_prefix="[Public] ")
+    if burst_response is not None:
+        return burst_response
+
     # Generate split payloads if split_field is configured
     split_payloads = processor.generate_split_payloads(alert_name, processed_alert, alert_labels)
     
@@ -1103,6 +1265,7 @@ async def receive_public_webhook(
                     rundeck_options=payload
                 )
                 REMEDIATION_WORKFLOWS.labels(alert_type=alert_name).inc()
+                remediation_manager.record_burst_fire(alert_name)
                 logger.info(f"[Public] Started remediation workflow: {workflow_id}")
                 audit_logger.log_workflow_started(
                     workflow_id, alert_name, labels,
@@ -1163,6 +1326,67 @@ async def get_rate_limits():
         "enabled": True,
         "stats": stats
     }
+
+
+@app.get("/api/v1/burst-suppressions")
+async def list_burst_suppressions():
+    """
+    List currently-suppressed alert types and their window counters.
+
+    Read-only — intended for operators to see what's paused before
+    deciding whether to dismiss. Window/counter snapshots are taken from
+    the in-memory state of the running pod (no DynamoDB lookup, no cross-
+    replica view).
+    """
+    if not remediation_manager:
+        raise HTTPException(status_code=503, detail="Remediation manager not available")
+
+    now = datetime.utcnow()
+    suppressed = []
+    for alert_name, until in remediation_manager._suppressed_until.items():
+        if until <= now:
+            continue
+        suppressed.append({
+            "alert_name": alert_name,
+            "suppressed_until": until.isoformat() + "Z",
+            "fires_in_window": len(remediation_manager._burst_window.get(alert_name, [])),
+        })
+
+    return {"suppressed": suppressed}
+
+
+@app.post("/api/v1/admin/burst-suppression/{alert_name}/dismiss")
+async def dismiss_burst_suppression(
+    alert_name: str,
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Operator-initiated dismissal of an active burst suppression.
+
+    Returns 404 if the alert_name was not actually suppressed, so a missing
+    or expired entry doesn't silently look like a successful dismissal.
+    The auth path is the same ``X-API-Key`` used by the public webhook so
+    we don't introduce a new credential surface for this admin action.
+    """
+    if not remediation_manager:
+        raise HTTPException(status_code=503, detail="Remediation manager not available")
+
+    was_suppressed = remediation_manager.clear_burst_suppression(alert_name)
+    if not was_suppressed:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No active burst suppression for alert_name '{alert_name}'",
+        )
+
+    BURST_SUPPRESSIONS.labels(
+        alert_type=alert_name, phase=BurstSuppressionPhase.DISMISSED
+    ).inc()
+    get_audit_logger().log_burst_suppression_dismissed(
+        alert_name=alert_name, actor="api_key"
+    )
+    logger.info(f"Burst suppression for '{alert_name}' dismissed via admin API")
+
+    return {"status": "dismissed", "alert_name": alert_name}
 
 
 def run_server():

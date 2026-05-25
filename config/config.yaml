@@ -60,6 +60,45 @@ alerts:
         ap-south-1:
           cluster_name: ap-south-1-prod
 
+  'Snowpipe infrastructure issues detected':
+      fields_location: commonLabels
+      job_id: 00d3661d-a008-49aa-9388-60acfbd5612a
+      remediation:
+        enabled: true
+        max_attempts: 2
+        job_retrigger_cooldown_minutes: 60
+        alertmanager_check_delay_minutes: 60
+        # Pause per-dataflow Rundeck triggering when an infra-wide spike
+        # is detected. After 5 distinct dataflows fire this alert within
+        # 10 minutes, subsequent alerts are dropped (with a Slack page)
+        # for 30 minutes or until manually dismissed via:
+        #   POST /api/v1/admin/burst-suppression/Snowpipe infrastructure issues detected/dismiss
+        burst_suppression:
+          enabled: true
+          threshold: 5
+          window_minutes: 10
+          suppression_minutes: 30
+      required_fields:
+        - dataflow_id
+        - puller_id
+      field_mappings:
+        dataflow_id: dataflow_id
+        puller_id: puller_id
+        
+  'Scheduler is unresponsive for more than 15m':
+    fields_location: commonLabels
+    job_id: a193565f-d16f-4f9b-8b7f-aaa25d70e755
+    remediation:
+      enabled: true
+      alertmanager_check_delay_minutes: 20
+      static_options:
+        labels_filter: "component=scheduler"
+    required_fields:
+      - namespace
+      - cluster
+    field_mappings:
+      cluster: cluster_name
+
   # FN Dataflow Internal Issues - requires customer action, so skip resolution check
   # Routes to different Rundeck jobs based on error_message field value
   'FN Dataflow Internal Issues':

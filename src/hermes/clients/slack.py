@@ -249,3 +249,74 @@ class SlackClient:
             text += f" (JIRA: {jira_ticket_id})"
         
         return await self.send_message(text)
+
+    async def send_burst_suppression_notification(
+        self,
+        alert_name: str,
+        threshold: int,
+        window_minutes: int,
+        suppression_minutes: int,
+        fires_in_window: int,
+        suppressed_until: str,
+    ) -> bool:
+        """
+        Notify NOC that burst suppression has engaged for an alert type.
+
+        Sent exactly once per suppression cycle (the caller is responsible
+        for de-duping via ``_suppression_notified_at``). Includes an
+        @mention of the NOC user group so the page actually wakes someone.
+        """
+        blocks: List[Dict[str, Any]] = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "🚧 Burst Suppression Engaged - Automation Paused",
+                    "emoji": True,
+                },
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"<!subteam^{self.noc_user_group}> - {fires_in_window} distinct "
+                        f"fingerprints of *{alert_name}* fired in the last "
+                        f"{window_minutes} min (threshold: {threshold}). "
+                        f"Treating as an infra-wide event; per-fingerprint "
+                        f"Rundeck triggering is paused for "
+                        f"{suppression_minutes} min."
+                    ),
+                },
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Alert:*\n{alert_name}"},
+                    {"type": "mrkdwn", "text": f"*Fires in window:*\n{fires_in_window}"},
+                    {"type": "mrkdwn", "text": f"*Threshold:*\nK={threshold} in {window_minutes} min"},
+                    {"type": "mrkdwn", "text": f"*Suppressed until:*\n{suppressed_until}"},
+                ],
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "*Next steps:*\n"
+                        "• Investigate the upstream infrastructure issue.\n"
+                        "• Dismiss suppression to resume per-fingerprint remediation: "
+                        "`POST /api/v1/admin/burst-suppression/<alert_name>/dismiss`.\n"
+                        "• Suppression auto-lifts after the window above."
+                    ),
+                },
+            },
+            {"type": "divider"},
+        ]
+
+        text = (
+            f"🚧 Burst Suppression: {alert_name} — {fires_in_window} fires in "
+            f"{window_minutes} min (>= {threshold}). @{self.noc_user_group} please investigate."
+        )
+
+        return await self.send_message(text, blocks)

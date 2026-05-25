@@ -33,6 +33,9 @@ class AuditEventType(str, Enum):
     CIRCUIT_BREAKER_OPENED = "circuit_breaker_opened"
     CIRCUIT_BREAKER_CLOSED = "circuit_breaker_closed"
     WORKFLOW_RECOVERED = "workflow_recovered"
+    BURST_SUPPRESSION_TRIPPED = "burst_suppression_tripped"
+    BURST_SUPPRESSION_DROPPED = "burst_suppression_dropped"
+    BURST_SUPPRESSION_DISMISSED = "burst_suppression_dismissed"
 
 
 @dataclass
@@ -257,6 +260,57 @@ class AuditLogger:
                 "previous_state": previous_state,
                 "action": "resumed_monitoring"
             }
+        )
+        self._log_event(event)
+
+    def log_burst_suppression_tripped(
+        self,
+        alert_name: str,
+        threshold: int,
+        window_minutes: int,
+        suppression_minutes: int,
+        fires_in_window: int,
+        suppressed_until: str,
+    ):
+        """Log when burst suppression engages for an alert type."""
+        event = self._create_event(
+            AuditEventType.BURST_SUPPRESSION_TRIPPED,
+            alert_name=alert_name,
+            details={
+                "threshold": threshold,
+                "window_minutes": window_minutes,
+                "suppression_minutes": suppression_minutes,
+                "fires_in_window": fires_in_window,
+                "suppressed_until": suppressed_until,
+            },
+        )
+        self._log_event(event)
+
+    def log_burst_suppression_dropped(
+        self,
+        alert_name: str,
+        alert_labels: Dict[str, str],
+        suppressed_until: str,
+    ):
+        """Log when an incoming alert is dropped because suppression is active."""
+        event = self._create_event(
+            AuditEventType.BURST_SUPPRESSION_DROPPED,
+            alert_name=alert_name,
+            alert_labels=alert_labels,
+            details={"suppressed_until": suppressed_until},
+        )
+        self._log_event(event)
+
+    def log_burst_suppression_dismissed(
+        self,
+        alert_name: str,
+        actor: Optional[str] = None,
+    ):
+        """Log when an operator manually clears a burst suppression."""
+        event = self._create_event(
+            AuditEventType.BURST_SUPPRESSION_DISMISSED,
+            alert_name=alert_name,
+            details={"actor": actor or "unknown"},
         )
         self._log_event(event)
 

@@ -93,6 +93,20 @@ class SlackNotificationType:
     """
 
     ESCALATION = "escalation"
+    BURST_SUPPRESSION = "burst_suppression"
+
+
+class BurstSuppressionPhase:
+    """Closed set of values for the ``phase`` label on :data:`BURST_SUPPRESSIONS`.
+
+    ``TRIPPED`` fires exactly once per suppression cycle (the alert that
+    crossed the threshold). ``DROPPED`` fires for every subsequent alert
+    received while suppression is active.
+    """
+
+    TRIPPED = "tripped"
+    DROPPED = "dropped"
+    DISMISSED = "dismissed"
 
 
 class WorkflowRecoveryOutcome:
@@ -206,6 +220,23 @@ RATE_LIMITED_REQUESTS = Counter(
     "hermes_rate_limited_requests_total",
     "Requests rejected by the per-source / global rate limiter.",
     ["source", "limit_type"],
+)
+
+BURST_SUPPRESSIONS = Counter(
+    "hermes_burst_suppressions_total",
+    "Burst-suppression events. ``phase=tripped`` is incremented exactly "
+    "once when the threshold is first crossed for an ``alert_type``; "
+    "``phase=dropped`` is incremented for every subsequent alert dropped "
+    "while suppression is active; ``phase=dismissed`` is incremented "
+    "when an operator clears the suppression manually.",
+    ["alert_type", "phase"],
+)
+
+BURST_SUPPRESSION_ACTIVE = Gauge(
+    "hermes_burst_suppression_active",
+    "Whether burst suppression is currently active for an alert type "
+    "(0=inactive, 1=active).",
+    ["alert_type"],
 )
 
 
@@ -457,6 +488,9 @@ __all__ = [
     "ALERTS_RECEIVED_BY_TYPE",
     "AttemptBucket",
     "BUILD_INFO",
+    "BURST_SUPPRESSION_ACTIVE",
+    "BURST_SUPPRESSIONS",
+    "BurstSuppressionPhase",
     "CIRCUIT_BREAKER_STATE",
     "CIRCUIT_BREAKER_TRIPS",
     "CONCURRENCY_LIMIT_HIT",
