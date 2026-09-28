@@ -1092,7 +1092,12 @@ class RemediationManager:
         """
         Called when we checked Alertmanager after job success and the alert is still firing.
         Implements retry policy: retrigger up to max_attempts, respecting cooldown.
-        Returns True if a retry was initiated, False if max attempts reached or error occurred.
+
+        The cooldown wait keeps watching for resolution, so an alert that clears while we
+        wait completes the workflow instead of being remediated again.
+
+        Returns True if a retry was initiated, False if the alert resolved during the
+        cooldown, max attempts were reached, or an error occurred.
         """
         logger.info(f"Alert still firing for workflow {workflow.id} (attempts={workflow.attempts})")
 
@@ -1112,11 +1117,28 @@ class RemediationManager:
             last = workflow.last_triggered_at or workflow.created_at
             elapsed_min = (datetime.utcnow() - last).total_seconds() / 60.0
 
-            # Respect cooldown: if not enough time elapsed, wait remaining time
+            # Respect cooldown: if not enough time elapsed, wait remaining time.
+            # Cooldowns run to a full day for some alerts, so the alert can clear long
+            # before the retrigger is due. Sleeping blind re-remediates a target that
+            # recovered hours ago and re-opens the ticket someone already closed.
             if elapsed_min < cooldown_minutes:
-                wait_seconds = int((cooldown_minutes - elapsed_min) * 60.0)
-                logger.info(f"Respecting cooldown for workflow {workflow.id}: waiting {wait_seconds}s before retrigger")
-                await asyncio.sleep(wait_seconds)
+                remaining_minutes = max(1, int(cooldown_minutes - elapsed_min))
+                logger.info(
+                    f"Respecting cooldown for workflow {workflow.id}: watching for resolution "
+                    f"for up to {remaining_minutes}m before retrigger"
+                )
+                resolved, resolution_method = await self._wait_for_alert_resolution(
+                    workflow,
+                    self._resolution_events.get(workflow.id) or asyncio.Event(),
+                    remaining_minutes,
+                )
+                if resolved:
+                    logger.info(
+                        f"Alert resolved during retrigger cooldown for workflow {workflow.id} "
+                        f"via {resolution_method}; skipping retrigger"
+                    )
+                    await self._handle_success(workflow)
+                    return False
 
             # Re-trigger Rundeck job using stored options
             options = workflow.rundeck_options
